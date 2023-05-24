@@ -95,8 +95,7 @@ fn main() {
                             Some(AddressFamily::Packet) => {
                                 acc.ether = address.to_string().to_uppercase()
                             }
-                            Some(_) => println!("unsupported address type"),
-                            None => println!("unknown address type"),
+                            _ => println!("unsupported address type"),
                         }
                     }
                     acc
