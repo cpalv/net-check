@@ -10,31 +10,11 @@ pub mod netlink {
     pub const U32_SZ: usize = mem::size_of::<u32>();
     pub const U16_SZ: usize = mem::size_of::<u16>();
 
-    fn copy_bytes_to_u16(dst: &mut u16, src: [u8; 2]) {
-        let mut scratch: [u8; 2] = [0; 2];
-
-        for (i, byte) in src.iter().enumerate() {
-            scratch[i] = *byte;
-        }
-
-        *dst = u16::from_ne_bytes(scratch);
-    }
-
-    fn copy_bytes_to_u32(dst: &mut u32, src: [u8; 4]) {
-        let mut scratch: [u8; 4] = [0; 4];
-
-        for (i, byte) in src.iter().enumerate() {
-            scratch[i] = *byte;
-        }
-
-        *dst = u32::from_ne_bytes(scratch);
-    }
-
     fn fun<O>(_op: O) -> PackingError {
         PackingError::InternalError
     }
 
-    #[derive(Copy, Clone, Debug, Default)]
+    #[derive(Copy, Clone, Debug, Default, PartialEq)]
     #[repr(C)]
     pub struct nlmsghdr {
         pub nlmsg_len: u32,
@@ -68,41 +48,22 @@ pub mod netlink {
 
             let mut bb = ByteBuffer::<NLMSG_HDR_SZ>::new();
 
-            bb.build(*src).map_err(|_| PackingError::InternalError)?;
+            bb.build(*src).map_err(fun)?;
 
             let mut current_idx = 0;
-
-            copy_bytes_to_u32(
-                &mut tmp.nlmsg_len,
-                bb.take_buf::<U32_SZ>(current_idx, U32_SZ).map_err(fun)?,
-            );
+            tmp.nlmsg_len = u32::from_ne_bytes(bb.take_buf::<U32_SZ>(current_idx).map_err(fun)?);
 
             current_idx += U32_SZ;
-
-            copy_bytes_to_u16(
-                &mut tmp.nlmsg_type,
-                bb.take_buf::<U16_SZ>(current_idx, U16_SZ).map_err(fun)?,
-            );
+            tmp.nlmsg_type = u16::from_ne_bytes(bb.take_buf::<U16_SZ>(current_idx).map_err(fun)?);
 
             current_idx += U16_SZ;
-
-            copy_bytes_to_u16(
-                &mut tmp.nlmsg_flags,
-                bb.take_buf::<U16_SZ>(current_idx, U16_SZ).map_err(fun)?,
-            );
+            tmp.nlmsg_flags = u16::from_ne_bytes(bb.take_buf::<U16_SZ>(current_idx).map_err(fun)?);
 
             current_idx += U16_SZ;
+            tmp.nlmsg_seq = u32::from_ne_bytes(bb.take_buf::<U32_SZ>(current_idx).map_err(fun)?);
 
-            copy_bytes_to_u32(
-                &mut tmp.nlmsg_seq,
-                bb.take_buf::<U32_SZ>(current_idx, U32_SZ).map_err(fun)?,
-            );
             current_idx += U32_SZ;
-
-            copy_bytes_to_u32(
-                &mut tmp.nlmsg_pid,
-                bb.take_buf::<U32_SZ>(current_idx, U32_SZ).map_err(fun)?,
-            );
+            tmp.nlmsg_pid = u32::from_ne_bytes(bb.take_buf::<U32_SZ>(current_idx).map_err(fun)?);
 
             Ok(tmp)
         }
@@ -140,23 +101,24 @@ pub mod netlink {
     }
 
     #[derive(Debug)]
-    pub struct ByteBuffer<const N: usize> {
+    pub struct ByteBuffer<const TOTAL_SZ: usize> {
         current_idx: usize,
-        total_sz: usize,
-        buf: [u8; N],
+        buf: [u8; TOTAL_SZ],
     }
 
-    impl<const N: usize> ByteBuffer<N> {
+    impl<const TOTAL_SZ: usize> ByteBuffer<TOTAL_SZ> {
         pub fn new() -> Self {
             Self {
                 current_idx: 0,
-                total_sz: N,
-                buf: [0; N],
+                buf: [0; TOTAL_SZ],
             }
         }
 
-        pub fn build<const J: usize>(&mut self, added_buf: [u8; J]) -> Result<(), String> {
-            if self.current_idx + added_buf.len() > self.total_sz {
+        pub fn build<const BUF_LEN: usize>(
+            &mut self,
+            added_buf: [u8; BUF_LEN],
+        ) -> Result<(), String> {
+            if self.current_idx + added_buf.len() > TOTAL_SZ {
                 return Err(String::from("Exceeded buffer capacity"));
             } else {
                 for byte in added_buf {
@@ -171,7 +133,7 @@ pub mod netlink {
             self.buf.as_mut_ptr()
         }
 
-        pub fn gib_buf(&self) -> &[u8; N] {
+        pub fn gib_buf(&self) -> &[u8; TOTAL_SZ] {
             &self.buf
         }
 
@@ -179,21 +141,20 @@ pub mod netlink {
             self.current_idx = 0
         }
 
-        pub fn sz(&self) -> usize {
-            self.total_sz
+        pub const fn sz(&self) -> usize {
+            TOTAL_SZ
         }
 
-        pub fn take_buf<const I: usize>(
+        pub fn take_buf<const NUM_BYTES: usize>(
             &self,
             start_idx: usize,
-            num_bytes: usize,
-        ) -> Result<[u8; I], String> {
-            let end_idx = start_idx + num_bytes;
-            if end_idx > self.total_sz {
+        ) -> Result<[u8; NUM_BYTES], String> {
+            let end_idx = start_idx + NUM_BYTES;
+            if end_idx > TOTAL_SZ {
                 return Err(String::from("End index exceeds buffer"));
             }
 
-            let mut scratch: [u8; I] = [0; I];
+            let mut scratch: [u8; NUM_BYTES] = [0; NUM_BYTES];
 
             for (i, byte) in self.buf[start_idx..end_idx].iter().enumerate() {
                 scratch[i] = *byte;
@@ -240,7 +201,28 @@ pub mod netlink {
                 nlmsg_seq: now,
                 nlmsg_pid: 0,
             };
-            assert_eq!(n.pack(), r.pack());
+
+            assert_eq!(n.pack().unwrap(), r.pack().unwrap())
+        }
+
+        #[test]
+        fn test_unpack() {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as u32;
+
+            let n = nlmsghdr {
+                nlmsg_len: 30,
+                nlmsg_type: 5,
+                nlmsg_flags: 10,
+                nlmsg_seq: now,
+                nlmsg_pid: 0,
+            };
+
+            let bytes = n.pack().unwrap();
+
+            assert_eq!(n, nlmsghdr::unpack(&bytes).unwrap())
         }
     }
 }
@@ -487,7 +469,7 @@ pub mod nic {
         pub fn start(&self) -> Result<(), String> {
             let mut ifr = ifreq {
                 ifr_name: self.c_ifname()?,
-                ifr_ifru: unsafe { std::mem::zeroed() },
+                ifr_ifru: unsafe { mem::zeroed() },
             };
 
             let sfd = quick_socket(AF_INET, SOCK_DGRAM, IPPROTO_IP)?;
@@ -510,7 +492,7 @@ pub mod nic {
         pub fn stop(&self) -> Result<(), String> {
             let mut ifr = ifreq {
                 ifr_name: self.c_ifname()?,
-                ifr_ifru: unsafe { std::mem::zeroed() },
+                ifr_ifru: unsafe { mem::zeroed() },
             };
 
             let sfd = quick_socket(AF_INET, SOCK_DGRAM, IPPROTO_IP)?;
@@ -556,11 +538,10 @@ pub mod nic {
                 nlmsg_flags: (NLM_F_REQUEST | NLM_F_DUMP) as u16,
                 nlmsg_seq: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .unwrap()
+                    .map_err(errstring)?
                     .as_secs() as u32,
                 nlmsg_pid: 0,
             };
-            let nl_buf = nl.pack().map_err(errstring)?;
 
             let rt = rtmsg {
                 rtm_family: AF_INET as u8,
@@ -575,31 +556,27 @@ pub mod nic {
 
                 rtm_flags: 0,
             };
-            let rt_buf = rt.pack().map_err(errstring)?;
 
             const nla: nlattr = nlattr {
                 nla_len: 8,
                 nla_type: RTA_TABLE,
             };
 
-            const PAYLOAD_SZ: usize = (nla.nla_len - (mem::size_of::<nlattr>() as u16)) as usize;
+            const PAYLOAD_SZ: usize = (nla.nla_len - NLA_SZ as u16) as usize;
             let mut payload = ByteBuffer::<PAYLOAD_SZ>::new();
             payload.build([RT_TABLE_MAIN])?;
 
-            let nla_buf = nla.pack().map_err(errstring)?;
-
             let nl_term = nlmsghdr::default();
-            let nl_term_buf = nl_term.pack().map_err(errstring)?;
 
-            const TOTAL_BUF_LEN: usize = MSG_BUF_LEN + mem::size_of::<nlmsghdr>();
+            const TOTAL_BUF_LEN: usize = MSG_BUF_LEN + NLMSG_HDR_SZ;
 
             let mut bb = ByteBuffer::<TOTAL_BUF_LEN>::new();
 
-            bb.build(nl_buf)?;
-            bb.build(rt_buf)?;
-            bb.build(nla_buf)?;
+            bb.build(nl.pack().map_err(errstring)?)?;
+            bb.build(rt.pack().map_err(errstring)?)?;
+            bb.build(nla.pack().map_err(errstring)?)?;
             bb.build(*payload.gib_buf())?;
-            bb.build(nl_term_buf)?;
+            bb.build(nl_term.pack().map_err(errstring)?)?;
 
             let buff = bb.gib_buf();
 
@@ -645,10 +622,10 @@ pub mod nic {
             if len < 0 {
                 return Err(Error::last_os_error().to_string());
             }
-            let nlhr = nlmsghdr::unpack(&nlmsgbuf.take_buf::<NLMSG_HDR_SZ>(0, NLMSG_HDR_SZ)?)
-                .map_err(errstring)?;
-            let rtm = rtmsg::unpack(&nlmsgbuf.take_buf::<RTMMSG_SZ>(NLMSG_HDR_SZ, RTMMSG_SZ)?)
-                .map_err(errstring)?;
+            let nlhr =
+                nlmsghdr::unpack(&nlmsgbuf.take_buf::<NLMSG_HDR_SZ>(0)?).map_err(errstring)?;
+            let rtm =
+                rtmsg::unpack(&nlmsgbuf.take_buf::<RTMMSG_SZ>(NLMSG_HDR_SZ)?).map_err(errstring)?;
             println!("recv'd nlhr: {:?} rtm: {:?}", nlhr, rtm);
 
             rust_close(sfd)
