@@ -1,5 +1,5 @@
 [package]
-name = "net-check"
+name = "netinterfacectl"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,3 +7,4 @@ edition = "2021"
 
 [dependencies]
 nix = "0.26.2"
+packed_struct = "0.10.1"
