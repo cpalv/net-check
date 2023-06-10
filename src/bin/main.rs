@@ -10,7 +10,7 @@ fn main() {
     for netif in netifs {
         println!("{netif}");
         if let Err(e) = netif.show_routes() {
-            println!("{e}");
+            eprintln!("{e}");
         }
         /*if netif.name == "enp6s0" {
             println!("restarting {}", netif.name);

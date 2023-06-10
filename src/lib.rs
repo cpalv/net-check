@@ -1,5 +1,4 @@
 pub mod netlink {
-
     use std::mem;
 
     use packed_struct::{prelude::PackedStruct, PackedStructInfo, PackingError};
@@ -10,12 +9,12 @@ pub mod netlink {
     pub const U32_SZ: usize = mem::size_of::<u32>();
     pub const U16_SZ: usize = mem::size_of::<u16>();
 
-    fn fun<O>(_op: O) -> PackingError {
+    fn fun<O: ToString>(_op: O) -> PackingError {
         PackingError::InternalError
     }
 
-    #[derive(Copy, Clone, Debug, Default, PartialEq)]
     #[repr(C)]
+    #[derive(Copy, Clone, Debug, Default, PartialEq)]
     pub struct nlmsghdr {
         pub nlmsg_len: u32,
         pub nlmsg_type: u16,
@@ -49,28 +48,24 @@ pub mod netlink {
             let mut bb = ByteBuffer::<NLMSG_HDR_SZ>::new();
 
             bb.build(*src).map_err(fun)?;
+            bb.reset();
 
-            let mut current_idx = 0;
-            tmp.nlmsg_len = u32::from_ne_bytes(bb.take_buf::<U32_SZ>(current_idx).map_err(fun)?);
+            tmp.nlmsg_len = u32::from_ne_bytes(bb.take_buf::<U32_SZ>().map_err(fun)?);
 
-            current_idx += U32_SZ;
-            tmp.nlmsg_type = u16::from_ne_bytes(bb.take_buf::<U16_SZ>(current_idx).map_err(fun)?);
+            tmp.nlmsg_type = u16::from_ne_bytes(bb.take_buf::<U16_SZ>().map_err(fun)?);
 
-            current_idx += U16_SZ;
-            tmp.nlmsg_flags = u16::from_ne_bytes(bb.take_buf::<U16_SZ>(current_idx).map_err(fun)?);
+            tmp.nlmsg_flags = u16::from_ne_bytes(bb.take_buf::<U16_SZ>().map_err(fun)?);
 
-            current_idx += U16_SZ;
-            tmp.nlmsg_seq = u32::from_ne_bytes(bb.take_buf::<U32_SZ>(current_idx).map_err(fun)?);
+            tmp.nlmsg_seq = u32::from_ne_bytes(bb.take_buf::<U32_SZ>().map_err(fun)?);
 
-            current_idx += U32_SZ;
-            tmp.nlmsg_pid = u32::from_ne_bytes(bb.take_buf::<U32_SZ>(current_idx).map_err(fun)?);
+            tmp.nlmsg_pid = u32::from_ne_bytes(bb.take_buf::<U32_SZ>().map_err(fun)?);
 
             Ok(tmp)
         }
     }
 
-    #[derive(Debug, Default, PackedStruct)]
     #[repr(C)]
+    #[derive(Debug, Default, PackedStruct)]
     pub struct rtmsg {
         pub rtm_family: u8,
         pub rtm_dst_len: u8,
@@ -84,8 +79,8 @@ pub mod netlink {
         pub rtm_flags: u32,
     }
 
-    #[derive(Debug, PackedStruct)]
     #[repr(C)]
+    #[derive(Debug, PackedStruct)]
     #[packed_struct(endian = "lsb")]
     pub struct nlattr {
         pub nla_len: u16,
@@ -93,8 +88,8 @@ pub mod netlink {
     }
 
     //#[derive(Debug, PackedStruct)]
-    #[derive(Debug)]
     #[repr(C)]
+    #[derive(Debug)]
     pub struct Nlamsg<const N: usize> {
         pub hdr: nlattr,
         pub payload: [u8; N],
@@ -133,6 +128,14 @@ pub mod netlink {
             self.buf.as_mut_ptr()
         }
 
+        pub fn idx(&self) -> usize {
+            self.current_idx
+        }
+
+        pub fn incr(&mut self, num_bytes: usize) {
+            self.current_idx += num_bytes
+        }
+
         pub fn gib_buf(&self) -> &[u8; TOTAL_SZ] {
             &self.buf
         }
@@ -145,21 +148,35 @@ pub mod netlink {
             TOTAL_SZ
         }
 
-        pub fn take_buf<const NUM_BYTES: usize>(
-            &self,
-            start_idx: usize,
-        ) -> Result<[u8; NUM_BYTES], String> {
-            let end_idx = start_idx + NUM_BYTES;
+        pub fn take_buf<const NUM_BYTES: usize>(&mut self) -> Result<[u8; NUM_BYTES], String> {
+            let end_idx = self.current_idx + NUM_BYTES;
             if end_idx > TOTAL_SZ {
                 return Err(String::from("End index exceeds buffer"));
             }
 
             let mut scratch: [u8; NUM_BYTES] = [0; NUM_BYTES];
 
-            for (i, byte) in self.buf[start_idx..end_idx].iter().enumerate() {
+            for (i, byte) in self.buf[self.current_idx..end_idx].iter().enumerate() {
                 scratch[i] = *byte;
             }
 
+            self.current_idx += NUM_BYTES;
+            Ok(scratch)
+        }
+
+        pub fn take_vec(&mut self, num_bytes: usize) -> Result<Vec<u8>, String> {
+            let end_idx = self.current_idx + num_bytes;
+            if end_idx > TOTAL_SZ {
+                return Err(String::from("End index exceeds buffer"));
+            }
+
+            let mut scratch = Vec::new();
+
+            for byte in self.buf[self.current_idx..end_idx].iter() {
+                scratch.push(*byte);
+            }
+
+            self.current_idx += num_bytes;
             Ok(scratch)
         }
     }
@@ -228,12 +245,11 @@ pub mod netlink {
 }
 
 pub mod nic {
-
     use core::fmt;
-    use core::u16;
 
     use std::ffi::{c_uchar, c_void};
     use std::io::Error;
+    use std::net::Ipv4Addr;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use std::{mem, ptr, thread};
 
@@ -241,29 +257,45 @@ pub mod nic {
     use nix::libc::{
         bind, close, ifreq, ioctl, iovec, msghdr, recvmsg, sendto, sockaddr, sockaddr_nl, socket,
         AF_INET, AF_NETLINK, IFF_UP, IFNAMSIZ, IPPROTO_IP, NETLINK_ROUTE, NLM_F_DUMP,
-        NLM_F_REQUEST, RTA_TABLE, RTM_GETROUTE, RTN_UNSPEC, RTPROT_UNSPEC, RT_SCOPE_UNIVERSE,
-        RT_TABLE_MAIN, RT_TABLE_UNSPEC, SIOCGIFFLAGS, SIOCSIFFLAGS, SOCK_CLOEXEC, SOCK_DGRAM,
-        SOCK_RAW,
+        NLM_F_REQUEST, RTA_DST, RTA_GATEWAY, RTA_OIF, RTA_PRIORITY, RTA_TABLE, RTM_GETROUTE,
+        RTN_UNSPEC, RTPROT_UNSPEC, RT_SCOPE_UNIVERSE, RT_TABLE_MAIN, RT_TABLE_UNSPEC, SIOCGIFFLAGS,
+        SIOCSIFFLAGS, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_RAW,
     };
     use nix::net::if_::InterfaceFlags;
     use nix::sys::socket::{AddressFamily, SockaddrLike, SockaddrStorage};
     use packed_struct::prelude::PackedStruct;
 
     use crate::netlink::{
-        nlattr,
-        nlmsghdr,
-        rtmsg,
-        ByteBuffer,
-        NLA_SZ,
-        NLMSG_HDR_SZ,
-        RTMMSG_SZ, // U16_SZ, U32_SZ,
+        nlattr, nlmsghdr, rtmsg, ByteBuffer, NLA_SZ, NLMSG_HDR_SZ, RTMMSG_SZ, U16_SZ, U32_SZ,
     };
 
-    fn errstring<E>(err: E) -> String
-    where
-        E: ToString,
-    {
+    fn errstring<E: ToString>(err: E) -> String {
         format!("{}:{} {}", file!(), line!(), err.to_string())
+    }
+
+    #[derive(Debug)]
+    struct Route {
+        table: u8,
+        protocol: u8,
+        scope: u8,
+        rt_priority: u8,
+        rta_dst: Ipv4Addr,
+        rta_gwy: Ipv4Addr,
+        rta_oif: u32,
+    }
+
+    impl Default for Route {
+        fn default() -> Self {
+            Self {
+                table: 0,
+                protocol: 0,
+                scope: 0,
+                rt_priority: 0,
+                rta_dst: Ipv4Addr::new(0, 0, 0, 0),
+                rta_gwy: Ipv4Addr::new(0, 0, 0, 0),
+                rta_oif: 0,
+            }
+        }
     }
 
     // HACKS: vars/functions redefined here to make the compiler happy
@@ -312,8 +344,62 @@ pub mod nic {
         Ok(())
     }
 
-    fn recv_nlmsg() {
-        todo!()
+    fn recv_nlmsg(sfd: i32, mhdr: *mut msghdr, flags: i32) -> Result<isize, String> {
+        let len = unsafe { recvmsg(sfd, mhdr, flags) };
+        if len < 0 {
+            return Err(Error::last_os_error().to_string());
+        }
+        Ok(len)
+    }
+
+    fn parse_msg<const TOTAL_SZ: usize>(
+        nlmsgbuf: &mut ByteBuffer<TOTAL_SZ>,
+    ) -> Result<Route, String> {
+        let nlhr = nlmsghdr::unpack(&nlmsgbuf.take_buf::<NLMSG_HDR_SZ>()?).map_err(errstring)?;
+        let rtm = rtmsg::unpack(&nlmsgbuf.take_buf::<RTMMSG_SZ>()?).map_err(errstring)?;
+
+        // parse remaining nlattr structs
+        let mut remaining_msg_bytes: isize =
+            (nlhr.nlmsg_len - ((NLMSG_HDR_SZ + RTMMSG_SZ) as u32)) as isize;
+
+        let mut rt = Route::default();
+
+        rt.scope = rtm.rtm_scope;
+        rt.table = rtm.rtm_table;
+        rt.protocol = rtm.rtm_protocol;
+
+        while remaining_msg_bytes > 0 {
+            let nla = nlattr::unpack(&nlmsgbuf.take_buf::<NLA_SZ>()?).map_err(errstring)?;
+
+            let remaining_nla_bytes = (nla.nla_len - (NLA_SZ as u16)) as usize;
+
+            match nla.nla_type {
+                RTA_TABLE => {
+                    rt.table = *nlmsgbuf.take_vec(remaining_nla_bytes)?.get(0).unwrap();
+                }
+                RTA_PRIORITY => {
+                    rt.rt_priority = *nlmsgbuf.take_vec(remaining_nla_bytes)?.get(0).unwrap();
+                }
+                RTA_GATEWAY => {
+                    let octets = transmute_vec::<U32_SZ>(nlmsgbuf.take_vec(remaining_nla_bytes)?)?;
+                    rt.rta_gwy = Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]);
+                }
+                RTA_DST => {
+                    let octets = transmute_vec::<U32_SZ>(nlmsgbuf.take_vec(remaining_nla_bytes)?)?;
+                    rt.rta_dst = Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]);
+                }
+                RTA_OIF => {
+                    rt.rta_oif = u32::from_ne_bytes(transmute_vec::<U32_SZ>(
+                        nlmsgbuf.take_vec(remaining_nla_bytes)?,
+                    )?);
+                }
+                _ => nlmsgbuf.incr(remaining_nla_bytes),
+            }
+
+            remaining_msg_bytes -= nla.nla_len as isize;
+        }
+
+        Ok(rt)
     }
 
     fn rust_close(sfd: i32) -> Result<(), String> {
@@ -364,6 +450,19 @@ pub mod nic {
         }
 
         netifs
+    }
+
+    fn transmute_vec<const NUM_BYTES: usize>(v: Vec<u8>) -> Result<[u8; NUM_BYTES], String> {
+        let mut scratch = [0; NUM_BYTES];
+        match v.len() {
+            U16_SZ | U32_SZ => {
+                for (i, byte) in v.iter().enumerate() {
+                    scratch[i] = *byte;
+                }
+                Ok(scratch)
+            }
+            _ => Err(String::from("Cannot transmute byte vector to byte array")),
+        }
     }
 
     #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -526,7 +625,7 @@ pub mod nic {
             todo!()
         }
 
-        fn send_request(&self, sfd: i32, sa: *const sockaddr) -> Result<(), String> {
+        fn send_request(&self, sfd: i32) -> Result<(), String> {
             const MSG_BUF_LEN: usize = NLMSG_HDR_SZ
                 + RTMMSG_SZ
                 + NLA_SZ
@@ -557,12 +656,12 @@ pub mod nic {
                 rtm_flags: 0,
             };
 
-            const nla: nlattr = nlattr {
+            const NLA: nlattr = nlattr {
                 nla_len: 8,
                 nla_type: RTA_TABLE,
             };
 
-            const PAYLOAD_SZ: usize = (nla.nla_len - NLA_SZ as u16) as usize;
+            const PAYLOAD_SZ: usize = (NLA.nla_len - NLA_SZ as u16) as usize;
             let mut payload = ByteBuffer::<PAYLOAD_SZ>::new();
             payload.build([RT_TABLE_MAIN])?;
 
@@ -574,15 +673,13 @@ pub mod nic {
 
             bb.build(nl.pack().map_err(errstring)?)?;
             bb.build(rt.pack().map_err(errstring)?)?;
-            bb.build(nla.pack().map_err(errstring)?)?;
+            bb.build(NLA.pack().map_err(errstring)?)?;
             bb.build(*payload.gib_buf())?;
             bb.build(nl_term.pack().map_err(errstring)?)?;
 
             let buff = bb.gib_buf();
 
             const SLACK: usize = 3;
-
-            checked_bind(sfd, sa, mem::size_of::<sockaddr_nl>() as u32)?;
 
             checked_sendto(
                 sfd,
@@ -599,7 +696,13 @@ pub mod nic {
             let mut sa: sockaddr_nl = unsafe { mem::zeroed() };
             sa.nl_family = AF_NETLINK as u16;
 
-            self.send_request(sfd, &sa as *const _ as *const sockaddr)?;
+            checked_bind(
+                sfd,
+                &sa as *const _ as *const sockaddr,
+                mem::size_of::<sockaddr_nl>() as u32,
+            )?;
+
+            self.send_request(sfd)?;
 
             let mut nlmsgbuf = ByteBuffer::<8192>::new();
 
@@ -613,20 +716,19 @@ pub mod nic {
                 msg_namelen: mem::size_of::<sockaddr_nl>() as u32,
                 msg_iov: &mut iov,
                 msg_iovlen: 1,
-                msg_control: ptr::null::<c_void>().cast_mut(),
+                msg_control: ptr::null_mut::<c_void>(),
                 msg_controllen: 0,
                 msg_flags: 0,
             };
 
-            let len = unsafe { recvmsg(sfd, &mut mhdr, 0) };
-            if len < 0 {
-                return Err(Error::last_os_error().to_string());
+            let rx_bytes = recv_nlmsg(sfd, &mut mhdr, 0)? as usize;
+
+            let mut i = 0;
+            while nlmsgbuf.idx() < rx_bytes {
+                let rt = parse_msg(&mut nlmsgbuf)?;
+                println!("Route {i}: {:?}", rt);
+                i += 1;
             }
-            let nlhr =
-                nlmsghdr::unpack(&nlmsgbuf.take_buf::<NLMSG_HDR_SZ>(0)?).map_err(errstring)?;
-            let rtm =
-                rtmsg::unpack(&nlmsgbuf.take_buf::<RTMMSG_SZ>(NLMSG_HDR_SZ)?).map_err(errstring)?;
-            println!("recv'd nlhr: {:?} rtm: {:?}", nlhr, rtm);
 
             rust_close(sfd)
         }
