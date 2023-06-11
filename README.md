@@ -1,3 +1,3 @@
 #  Net Check
 
-Getting familiar with Rust, implementing parts of ifconfig
+Getting familiar with Rust and C interop, implementing parts of ifconfig/ip cmds

@@ -1,6 +1,10 @@
 pub mod netlink {
     use std::mem;
 
+    /*use nix::libc::{
+        RTA_DST, RTA_GATEWAY, RTA_OIF, RTA_PRIORITY, RTA_TABLE, RTM_DELROUTE, RTM_GETROUTE,
+        RTM_NEWROUTE,
+    };*/
     use packed_struct::{prelude::PackedStruct, PackedStructInfo, PackingError};
 
     pub const NLMSG_HDR_SZ: usize = mem::size_of::<nlmsghdr>();
@@ -12,6 +16,23 @@ pub mod netlink {
     fn fun<O: ToString>(_op: O) -> PackingError {
         PackingError::InternalError
     }
+
+    /*#[repr(u16)]
+    pub enum NlmsgType {
+        RtmGetRoute = RTM_GETROUTE,
+        RtmAddRoute = RTM_NEWROUTE,
+        RtmDelRoute = RTM_DELROUTE,
+    }
+
+    #[repr(u16)]
+    #[derive(Debug, PackedStruct)]
+    pub enum NlaType {
+        RtaTable = RTA_TABLE,
+        RtaPriorrity = RTA_PRIORITY,
+        RtaGateway = RTA_GATEWAY,
+        RtaDestination = RTA_DST,
+        RtaOIF = RTA_OIF,
+    }*/
 
     #[repr(C)]
     #[derive(Copy, Clone, Debug, Default, PartialEq)]
@@ -85,6 +106,8 @@ pub mod netlink {
     pub struct nlattr {
         pub nla_len: u16,
         pub nla_type: u16,
+        /*#[packed_field(element_size_bytes = "2")]
+        pub nla_type: NlaType,*/
     }
 
     //#[derive(Debug, PackedStruct)]
@@ -134,6 +157,18 @@ pub mod netlink {
 
         pub fn incr(&mut self, num_bytes: usize) {
             self.current_idx += num_bytes
+        }
+
+        pub fn ptr(&self) -> *const u8 {
+            self.buf.as_ptr()
+        }
+
+        pub fn ptr_cast<T>(&self) -> Result<*const T, String> {
+            let bytes = mem::size_of::<T>();
+            if self.current_idx + bytes > TOTAL_SZ {
+                return Err(String::from("ptr ran off the highway"));
+            }
+            Ok(unsafe { self.buf.as_ptr().offset(bytes as isize) } as *const T)
         }
 
         pub fn gib_buf(&self) -> &[u8; TOTAL_SZ] {
@@ -302,16 +337,16 @@ pub mod nic {
     // https://docs.rs/libc/latest/src/libc/unix/linux_like/linux/mod.rs.html#2885-2886
     const NLA_ALIGNTO: i32 = 4;
 
-    //const NLMSG_ALIGNTO: u32 = 4;
-
     // https://docs.rs/libc/latest/src/libc/unix/linux_like/linux/mod.rs.html#3926-3928
     const fn rust_nla_align(len: i32) -> i32 {
         ((len) + NLA_ALIGNTO - 1) & !(NLA_ALIGNTO - 1)
     }
 
-    /*const fn rust_nlmsg_align(len: u32) -> u32 {
+    const NLMSG_ALIGNTO: u32 = 4;
+
+    const fn rust_nlmsg_align(len: u32) -> u32 {
         ((len) + NLMSG_ALIGNTO - 1) & !(NLMSG_ALIGNTO - 1)
-    }*/
+    }
 
     fn quick_socket(domain: i32, sock_type: i32, protocol: i32) -> Result<i32, String> {
         let sfd = unsafe { socket(domain, sock_type, protocol) };
@@ -352,6 +387,7 @@ pub mod nic {
         Ok(len)
     }
 
+    // https://man7.org/linux/man-pages/man7/netlink.7.html#EXAMPLES
     fn parse_msg<const TOTAL_SZ: usize>(
         nlmsgbuf: &mut ByteBuffer<TOTAL_SZ>,
     ) -> Result<Route, String> {
@@ -426,9 +462,19 @@ pub mod nic {
                         if let Some(address) = ia.address {
                             match address.family() {
                                 Some(AddressFamily::Inet) => {
-                                    acc.ip4_address = ia.address;
+                                    acc.ip4_host_addr = ia.address;
                                     acc.broadcast = ia.broadcast;
                                     acc.ip4_netmask = ia.netmask;
+                                    if let (Some(ip4_host_addr), Some(ip4_netmask)) =
+                                        (ia.address, ia.netmask)
+                                    {
+                                        let net_addr = ip4_host_addr.as_sockaddr_in().unwrap().ip()
+                                            & ip4_netmask.as_sockaddr_in().unwrap().ip();
+                                        let octets = net_addr.to_be_bytes();
+                                        acc.ip4_net_addr = Some(Ipv4Addr::new(
+                                            octets[0], octets[1], octets[2], octets[3],
+                                        ));
+                                    }
                                 }
                                 Some(AddressFamily::Inet6) => {
                                     acc.ip6_addresses.push(ia.address);
@@ -468,8 +514,9 @@ pub mod nic {
     #[derive(Clone, Debug, Eq, Hash, PartialEq)]
     pub struct NetworkInterface {
         pub name: String,
-        ip4_address: Option<SockaddrStorage>,
+        ip4_host_addr: Option<SockaddrStorage>,
         ip4_netmask: Option<SockaddrStorage>,
+        ip4_net_addr: Option<Ipv4Addr>,
         broadcast: Option<SockaddrStorage>,
         ip6_addresses: Vec<Option<SockaddrStorage>>,
         ip6_netmasks: Vec<Option<SockaddrStorage>>,
@@ -481,8 +528,9 @@ pub mod nic {
         fn default() -> Self {
             Self {
                 name: String::new(),
-                ip4_address: None,
+                ip4_host_addr: None,
                 ip4_netmask: None,
+                ip4_net_addr: None,
                 broadcast: None,
                 ip6_addresses: vec![],
                 ip6_netmasks: vec![],
@@ -495,11 +543,15 @@ pub mod nic {
     impl fmt::Display for NetworkInterface {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
             let mut interface_info = format!("Interface: {}\n", self.name);
-            if let (Some(ip4_addr), Some(ip4_mask)) = (self.ip4_address, self.ip4_netmask) {
+            if let (Some(ip4_addr), Some(ip4_mask)) = (self.ip4_host_addr, self.ip4_netmask) {
                 if let Some(broadcast) = self.broadcast {
                     interface_info.push_str(
                         format!(
-                            "IPv4: {}/{} Broadcast: {}\n",
+                            "IPv4:
+                            \tNetwork Address: {}
+                            \tHost Address: {}/{}
+                            \tBroadcast: {}\n",
+                            self.ip4_net_addr.unwrap(),
                             ip4_addr.to_string().replace(":0", ""),
                             ip4_mask.as_sockaddr_in().unwrap().ip().count_ones(),
                             broadcast.to_string().replace(":0", "")
@@ -625,15 +677,16 @@ pub mod nic {
             todo!()
         }
 
-        fn send_request(&self, sfd: i32) -> Result<(), String> {
-            const MSG_BUF_LEN: usize = NLMSG_HDR_SZ
-                + RTMMSG_SZ
+        // https://man7.org/linux/man-pages/man7/netlink.7.html#EXAMPLES
+        fn send_request(&self, sfd: i32, nlmsg_type: u16) -> Result<(), String> {
+            const MSG_BUF_LEN: usize = (rust_nlmsg_align((NLMSG_HDR_SZ + RTMMSG_SZ) as u32)
+                as usize)
                 + NLA_SZ
                 + (rust_nla_align(mem::size_of::<c_uchar>() as i32)) as usize;
 
-            let nl = nlmsghdr {
+            let nh = nlmsghdr {
                 nlmsg_len: MSG_BUF_LEN as u32,
-                nlmsg_type: RTM_GETROUTE,
+                nlmsg_type: nlmsg_type,
                 nlmsg_flags: (NLM_F_REQUEST | NLM_F_DUMP) as u16,
                 nlmsg_seq: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -671,7 +724,7 @@ pub mod nic {
 
             let mut bb = ByteBuffer::<TOTAL_BUF_LEN>::new();
 
-            bb.build(nl.pack().map_err(errstring)?)?;
+            bb.build(nh.pack().map_err(errstring)?)?;
             bb.build(rt.pack().map_err(errstring)?)?;
             bb.build(NLA.pack().map_err(errstring)?)?;
             bb.build(*payload.gib_buf())?;
@@ -702,7 +755,7 @@ pub mod nic {
                 mem::size_of::<sockaddr_nl>() as u32,
             )?;
 
-            self.send_request(sfd)?;
+            self.send_request(sfd, RTM_GETROUTE)?;
 
             let mut nlmsgbuf = ByteBuffer::<8192>::new();
 

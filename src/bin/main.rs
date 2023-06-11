@@ -15,7 +15,7 @@ fn main() {
         /*if netif.name == "enp6s0" {
             println!("restarting {}", netif.name);
             if let Err(res) = netif.restart() {
-                println!("{res}");
+                eprintln!("{res}");
             }
         }*/
     }
