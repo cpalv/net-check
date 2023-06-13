@@ -1,10 +1,10 @@
 pub mod netlink {
     use std::mem;
 
-    /*use nix::libc::{
-        RTA_DST, RTA_GATEWAY, RTA_OIF, RTA_PRIORITY, RTA_TABLE, RTM_DELROUTE, RTM_GETROUTE,
-        RTM_NEWROUTE,
-    };*/
+    use nix::libc::{
+        NLMSG_ERROR, RTA_DST, RTA_GATEWAY, RTA_OIF, RTA_PREFSRC, RTA_PRIORITY, RTA_TABLE,
+        RTM_DELROUTE, RTM_GETROUTE, RTM_NEWROUTE,
+    };
     use packed_struct::{prelude::PackedStruct, PackedStructInfo, PackingError};
 
     pub const NLMSG_HDR_SZ: usize = mem::size_of::<nlmsghdr>();
@@ -13,26 +13,33 @@ pub mod netlink {
     pub const U32_SZ: usize = mem::size_of::<u32>();
     pub const U16_SZ: usize = mem::size_of::<u16>();
 
+    // HACKS: vars/functions redefined here to make the compiler happy
+    // https://docs.rs/libc/latest/src/libc/unix/linux_like/linux/mod.rs.html#2885-2886
+    const NLA_ALIGNTO: i32 = 4;
+
+    // https://docs.rs/libc/latest/src/libc/unix/linux_like/linux/mod.rs.html#3926-3928
+    pub const fn rust_nla_align(len: i32) -> i32 {
+        ((len) + NLA_ALIGNTO - 1) & !(NLA_ALIGNTO - 1)
+    }
+
+    const NLMSG_ALIGNTO: u32 = 4;
+
+    pub const fn rust_nlmsg_align(len: u32) -> u32 {
+        ((len) + NLMSG_ALIGNTO - 1) & !(NLMSG_ALIGNTO - 1)
+    }
+
     fn fun<O: ToString>(_op: O) -> PackingError {
         PackingError::InternalError
     }
 
-    /*#[repr(u16)]
+    #[repr(u16)]
+    #[derive(Clone, Copy, Debug)]
     pub enum NlmsgType {
         RtmGetRoute = RTM_GETROUTE,
         RtmAddRoute = RTM_NEWROUTE,
         RtmDelRoute = RTM_DELROUTE,
+        NlmsgError = NLMSG_ERROR as u16,
     }
-
-    #[repr(u16)]
-    #[derive(Debug, PackedStruct)]
-    pub enum NlaType {
-        RtaTable = RTA_TABLE,
-        RtaPriorrity = RTA_PRIORITY,
-        RtaGateway = RTA_GATEWAY,
-        RtaDestination = RTA_DST,
-        RtaOIF = RTA_OIF,
-    }*/
 
     #[repr(C)]
     #[derive(Copy, Clone, Debug, Default, PartialEq)]
@@ -46,7 +53,7 @@ pub mod netlink {
 
     impl PackedStructInfo for nlmsghdr {
         fn packed_bits() -> usize {
-            NLMSG_HDR_SZ
+            NLMSG_HDR_SZ * 8
         }
     }
 
@@ -54,11 +61,16 @@ pub mod netlink {
         type ByteArray = [u8; NLMSG_HDR_SZ];
         fn pack(&self) -> packed_struct::PackingResult<Self::ByteArray> {
             let mut bb = ByteBuffer::<NLMSG_HDR_SZ>::new();
-            bb.build(self.nlmsg_len.to_ne_bytes()).map_err(fun)?;
-            bb.build(self.nlmsg_type.to_ne_bytes()).map_err(fun)?;
-            bb.build(self.nlmsg_flags.to_ne_bytes()).map_err(fun)?;
-            bb.build(self.nlmsg_seq.to_ne_bytes()).map_err(fun)?;
-            bb.build(self.nlmsg_pid.to_ne_bytes()).map_err(fun)?;
+            bb.build(self.nlmsg_len.to_ne_bytes())
+                .map_err(fun)?
+                .build(self.nlmsg_type.to_ne_bytes())
+                .map_err(fun)?
+                .build(self.nlmsg_flags.to_ne_bytes())
+                .map_err(fun)?
+                .build(self.nlmsg_seq.to_ne_bytes())
+                .map_err(fun)?
+                .build(self.nlmsg_pid.to_ne_bytes())
+                .map_err(fun)?;
 
             Ok(bb.buf)
         }
@@ -100,6 +112,17 @@ pub mod netlink {
         pub rtm_flags: u32,
     }
 
+    #[repr(u16)]
+    #[derive(Debug)]
+    pub enum NlaType {
+        RtaTable = RTA_TABLE,
+        RtaPriority = RTA_PRIORITY,
+        RtaGateway = RTA_GATEWAY,
+        RtaDestination = RTA_DST,
+        RtaPrefSource = RTA_PREFSRC,
+        RtaOIF = RTA_OIF,
+    }
+
     #[repr(C)]
     #[derive(Debug, PackedStruct)]
     #[packed_struct(endian = "lsb")]
@@ -108,6 +131,26 @@ pub mod netlink {
         pub nla_type: u16,
         /*#[packed_field(element_size_bytes = "2")]
         pub nla_type: NlaType,*/
+    }
+
+    pub fn create_nlattrs(nla_data: Vec<(NlaType, Vec<u8>)>) -> Result<Vec<u8>, String> {
+        let mut v = Vec::new();
+        for (nla_type, bytes) in nla_data {
+            let nla = nlattr {
+                nla_len: (NLA_SZ + bytes.len()) as u16,
+                nla_type: nla_type as u16,
+            }
+            .pack()
+            .map_err(|e| String::from(format!("{}: error converting nlattr to bytes", e)))?;
+
+            v.append(&mut nla.to_vec());
+            v.append(&mut bytes.to_vec());
+        }
+
+        let nla_pad = (rust_nla_align(v.len() as i32) as usize) - v.len();
+        v.append(&mut vec![0; nla_pad]);
+
+        Ok(v)
     }
 
     //#[derive(Debug, PackedStruct)]
@@ -135,7 +178,7 @@ pub mod netlink {
         pub fn build<const BUF_LEN: usize>(
             &mut self,
             added_buf: [u8; BUF_LEN],
-        ) -> Result<(), String> {
+        ) -> Result<&mut Self, String> {
             if self.current_idx + added_buf.len() > TOTAL_SZ {
                 return Err(String::from("Exceeded buffer capacity"));
             } else {
@@ -144,7 +187,7 @@ pub mod netlink {
                     self.current_idx += 1;
                 }
             }
-            Ok(())
+            Ok(self)
         }
 
         pub fn buf_mut_ptr(&mut self) -> *mut u8 {
@@ -163,12 +206,14 @@ pub mod netlink {
             self.buf.as_ptr()
         }
 
-        pub fn ptr_cast<T>(&self) -> Result<*const T, String> {
+        pub fn ptr_cast<T>(&mut self) -> Result<*const T, String> {
             let bytes = mem::size_of::<T>();
             if self.current_idx + bytes > TOTAL_SZ {
                 return Err(String::from("ptr ran off the highway"));
             }
-            Ok(unsafe { self.buf.as_ptr().offset(bytes as isize) } as *const T)
+            let ok = Ok(unsafe { self.buf.as_ptr().offset(self.current_idx as isize) } as *const T);
+            self.current_idx += bytes;
+            ok
         }
 
         pub fn gib_buf(&self) -> &[u8; TOTAL_SZ] {
@@ -284,16 +329,17 @@ pub mod nic {
 
     use std::ffi::{c_uchar, c_void};
     use std::io::Error;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, SocketAddrV4};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use std::{mem, ptr, thread};
 
     use nix::ifaddrs::{self, InterfaceAddress};
     use nix::libc::{
-        bind, close, ifreq, ioctl, iovec, msghdr, recvmsg, sendto, sockaddr, sockaddr_nl, socket,
-        AF_INET, AF_NETLINK, IFF_UP, IFNAMSIZ, IPPROTO_IP, NETLINK_ROUTE, NLM_F_DUMP,
-        NLM_F_REQUEST, RTA_DST, RTA_GATEWAY, RTA_OIF, RTA_PRIORITY, RTA_TABLE, RTM_GETROUTE,
-        RTN_UNSPEC, RTPROT_UNSPEC, RT_SCOPE_UNIVERSE, RT_TABLE_MAIN, RT_TABLE_UNSPEC, SIOCGIFFLAGS,
+        bind, close, if_nametoindex, ifreq, ioctl, iovec, msghdr, recvmsg, sendto, sockaddr,
+        sockaddr_nl, socket, AF_INET, AF_NETLINK, IFF_UP, IFNAMSIZ, IPPROTO_IP, NETLINK_ROUTE,
+        NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REQUEST, RTA_DST, RTA_GATEWAY,
+        RTA_OIF, RTA_PRIORITY, RTA_TABLE, RTN_UNICAST, RTN_UNSPEC, RTPROT_KERNEL, RTPROT_UNSPEC,
+        RT_SCOPE_LINK, RT_SCOPE_UNIVERSE, RT_TABLE_MAIN, RT_TABLE_UNSPEC, SIOCGIFFLAGS,
         SIOCSIFFLAGS, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_RAW,
     };
     use nix::net::if_::InterfaceFlags;
@@ -301,7 +347,8 @@ pub mod nic {
     use packed_struct::prelude::PackedStruct;
 
     use crate::netlink::{
-        nlattr, nlmsghdr, rtmsg, ByteBuffer, NLA_SZ, NLMSG_HDR_SZ, RTMMSG_SZ, U16_SZ, U32_SZ,
+        create_nlattrs, nlattr, nlmsghdr, rtmsg, rust_nla_align, rust_nlmsg_align, ByteBuffer,
+        NlaType, NlmsgType, NLA_SZ, NLMSG_HDR_SZ, RTMMSG_SZ, U16_SZ, U32_SZ,
     };
 
     fn errstring<E: ToString>(err: E) -> String {
@@ -331,21 +378,6 @@ pub mod nic {
                 rta_oif: 0,
             }
         }
-    }
-
-    // HACKS: vars/functions redefined here to make the compiler happy
-    // https://docs.rs/libc/latest/src/libc/unix/linux_like/linux/mod.rs.html#2885-2886
-    const NLA_ALIGNTO: i32 = 4;
-
-    // https://docs.rs/libc/latest/src/libc/unix/linux_like/linux/mod.rs.html#3926-3928
-    const fn rust_nla_align(len: i32) -> i32 {
-        ((len) + NLA_ALIGNTO - 1) & !(NLA_ALIGNTO - 1)
-    }
-
-    const NLMSG_ALIGNTO: u32 = 4;
-
-    const fn rust_nlmsg_align(len: u32) -> u32 {
-        ((len) + NLMSG_ALIGNTO - 1) & !(NLMSG_ALIGNTO - 1)
     }
 
     fn quick_socket(domain: i32, sock_type: i32, protocol: i32) -> Result<i32, String> {
@@ -471,9 +503,13 @@ pub mod nic {
                                         let net_addr = ip4_host_addr.as_sockaddr_in().unwrap().ip()
                                             & ip4_netmask.as_sockaddr_in().unwrap().ip();
                                         let octets = net_addr.to_be_bytes();
-                                        acc.ip4_net_addr = Some(Ipv4Addr::new(
-                                            octets[0], octets[1], octets[2], octets[3],
-                                        ));
+                                        acc.ip4_net_addr =
+                                            Some(SockaddrStorage::from(SocketAddrV4::new(
+                                                Ipv4Addr::new(
+                                                    octets[0], octets[1], octets[2], octets[3],
+                                                ),
+                                                0,
+                                            )));
                                     }
                                 }
                                 Some(AddressFamily::Inet6) => {
@@ -516,7 +552,8 @@ pub mod nic {
         pub name: String,
         ip4_host_addr: Option<SockaddrStorage>,
         ip4_netmask: Option<SockaddrStorage>,
-        ip4_net_addr: Option<Ipv4Addr>,
+        ip4_net_addr: Option<SockaddrStorage>,
+        ip4_gatway: Option<SockaddrStorage>,
         broadcast: Option<SockaddrStorage>,
         ip6_addresses: Vec<Option<SockaddrStorage>>,
         ip6_netmasks: Vec<Option<SockaddrStorage>>,
@@ -531,6 +568,7 @@ pub mod nic {
                 ip4_host_addr: None,
                 ip4_netmask: None,
                 ip4_net_addr: None,
+                ip4_gatway: None,
                 broadcast: None,
                 ip6_addresses: vec![],
                 ip6_netmasks: vec![],
@@ -617,6 +655,15 @@ pub mod nic {
             Ok(ifname)
         }
 
+        fn ip4_cidr(&self) -> u8 {
+            self.ip4_netmask
+                .unwrap()
+                .as_sockaddr_in()
+                .unwrap()
+                .ip()
+                .count_ones() as u8
+        }
+
         pub fn start(&self) -> Result<(), String> {
             let mut ifr = ifreq {
                 ifr_name: self.c_ifname()?,
@@ -669,75 +716,301 @@ pub mod nic {
             self.start()
         }
 
-        pub fn add_route(&self) {
-            todo!()
+        pub fn add_route(&self, protocol: u8, scope: u8) -> Result<(), String> {
+            let sfd = quick_socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)?;
+            let mut sa: sockaddr_nl = unsafe { mem::zeroed() };
+            sa.nl_family = AF_NETLINK as u16;
+
+            checked_bind(
+                sfd,
+                &sa as *const _ as *const sockaddr,
+                mem::size_of::<sockaddr_nl>() as u32,
+            )?;
+
+            self.send_request(sfd, NlmsgType::RtmAddRoute, protocol, scope)?;
+
+            let mut nlmsgbuf = ByteBuffer::<8192>::new();
+
+            let mut iov = iovec {
+                iov_base: nlmsgbuf.buf_mut_ptr() as *mut c_void,
+                iov_len: nlmsgbuf.sz(),
+            };
+
+            let mut mhdr = msghdr {
+                msg_name: &mut sa as *mut _ as *mut c_void,
+                msg_namelen: mem::size_of::<sockaddr_nl>() as u32,
+                msg_iov: &mut iov,
+                msg_iovlen: 1,
+                msg_control: ptr::null_mut::<c_void>(),
+                msg_controllen: 0,
+                msg_flags: 0,
+            };
+
+            let rx_bytes = recv_nlmsg(sfd, &mut mhdr, 0)? as usize;
+
+            let mut i = 0;
+            while nlmsgbuf.idx() < rx_bytes {
+                let rt = parse_msg(&mut nlmsgbuf)?;
+                println!("Route {i}: {:?}", rt);
+                i += 1;
+            }
+
+            rust_close(sfd)
         }
 
-        pub fn del_route(&self) {
-            todo!()
+        pub fn del_route(&self /* , protocol: u8, scope: u8*/) -> Result<(), String> {
+            let sfd = quick_socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)?;
+            let mut sa: sockaddr_nl = unsafe { mem::zeroed() };
+            sa.nl_family = AF_NETLINK as u16;
+
+            checked_bind(
+                sfd,
+                &sa as *const _ as *const sockaddr,
+                mem::size_of::<sockaddr_nl>() as u32,
+            )?;
+
+            self.send_request(sfd, NlmsgType::RtmDelRoute, RTPROT_KERNEL, RT_SCOPE_LINK)?;
+
+            let mut nlmsgbuf = ByteBuffer::<8192>::new();
+
+            let mut iov = iovec {
+                iov_base: nlmsgbuf.buf_mut_ptr() as *mut c_void,
+                iov_len: nlmsgbuf.sz(),
+            };
+
+            let mut mhdr = msghdr {
+                msg_name: &mut sa as *mut _ as *mut c_void,
+                msg_namelen: mem::size_of::<sockaddr_nl>() as u32,
+                msg_iov: &mut iov,
+                msg_iovlen: 1,
+                msg_control: ptr::null_mut::<c_void>(),
+                msg_controllen: 0,
+                msg_flags: 0,
+            };
+
+            let rx_bytes = recv_nlmsg(sfd, &mut mhdr, 0)? as usize;
+
+            let mut i = 0;
+            while nlmsgbuf.idx() < rx_bytes {
+                let rt = parse_msg(&mut nlmsgbuf)?;
+                println!("Route {i}: {:?}", rt);
+                i += 1;
+            }
+
+            rust_close(sfd)
         }
 
         // https://man7.org/linux/man-pages/man7/netlink.7.html#EXAMPLES
-        fn send_request(&self, sfd: i32, nlmsg_type: u16) -> Result<(), String> {
-            const MSG_BUF_LEN: usize = (rust_nlmsg_align((NLMSG_HDR_SZ + RTMMSG_SZ) as u32)
-                as usize)
-                + NLA_SZ
-                + (rust_nla_align(mem::size_of::<c_uchar>() as i32)) as usize;
+        fn send_request(
+            &self,
+            sfd: i32,
+            nlmsg_type: NlmsgType,
+            protocol: u8,
+            scope: u8,
+        ) -> Result<(), String> {
+            let v = match nlmsg_type {
+                NlmsgType::RtmGetRoute => {
+                    const MSG_BUF_LEN: usize = (rust_nlmsg_align((NLMSG_HDR_SZ + RTMMSG_SZ) as u32)
+                        as usize)
+                        + NLA_SZ
+                        + (rust_nla_align(mem::size_of::<c_uchar>() as i32)) as usize;
 
-            let nh = nlmsghdr {
-                nlmsg_len: MSG_BUF_LEN as u32,
-                nlmsg_type: nlmsg_type,
-                nlmsg_flags: (NLM_F_REQUEST | NLM_F_DUMP) as u16,
-                nlmsg_seq: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(errstring)?
-                    .as_secs() as u32,
-                nlmsg_pid: 0,
+                    let nh = nlmsghdr {
+                        nlmsg_len: MSG_BUF_LEN as u32,
+                        nlmsg_type: nlmsg_type as u16,
+                        nlmsg_flags: (NLM_F_REQUEST | NLM_F_DUMP) as u16,
+                        nlmsg_seq: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map_err(errstring)?
+                            .as_secs() as u32,
+                        nlmsg_pid: 0,
+                    };
+
+                    let rt = rtmsg {
+                        rtm_family: AF_INET as u8,
+                        rtm_dst_len: 0,
+                        rtm_src_len: 0,
+                        rtm_tos: 0,
+                        rtm_table: RT_TABLE_UNSPEC,
+
+                        rtm_protocol: protocol,
+                        rtm_scope: scope,
+                        rtm_type: RTN_UNSPEC,
+
+                        rtm_flags: 0,
+                    };
+
+                    let mut payload = Vec::with_capacity(rust_nla_align(
+                        mem::size_of::<c_uchar>() as i32
+                    ) as usize);
+                    payload.push(RT_TABLE_MAIN);
+                    let nla_data = vec![(NlaType::RtaTable, payload)];
+                    let mut nla_bytes = create_nlattrs(nla_data)?;
+
+                    let nl_term = nlmsghdr::default();
+
+                    let mut v = Vec::new();
+                    v.append(&mut nh.pack().map_err(errstring)?.to_vec());
+                    v.append(&mut rt.pack().map_err(errstring)?.to_vec());
+                    v.append(&mut nla_bytes);
+                    v.append(&mut nl_term.pack().map_err(errstring)?.to_vec());
+
+                    v
+                }
+                NlmsgType::RtmDelRoute => {
+                    let rt = rtmsg {
+                        rtm_family: AF_INET as u8,
+                        rtm_dst_len: self.ip4_cidr(),
+                        rtm_src_len: 0,
+                        rtm_tos: 0,
+                        rtm_table: RT_TABLE_MAIN,
+
+                        /*rtm_protocol: RTPROT_KERNEL,
+                        rtm_scope: RT_SCOPE_LINK,*/
+                        rtm_protocol: protocol,
+                        rtm_scope: scope,
+                        rtm_type: RTN_UNSPEC,
+
+                        rtm_flags: 0,
+                    };
+
+                    let mut nlas = create_nlattrs(vec![
+                        (
+                            NlaType::RtaDestination,
+                            self.ip4_net_addr
+                                .unwrap()
+                                .as_sockaddr_in()
+                                .unwrap()
+                                .ip()
+                                .to_be_bytes()
+                                .to_vec(),
+                        ),
+                        (
+                            NlaType::RtaPrefSource,
+                            self.ip4_host_addr
+                                .unwrap()
+                                .as_sockaddr_in()
+                                .unwrap()
+                                .ip()
+                                .to_be_bytes()
+                                .to_vec(),
+                        ),
+                        (NlaType::RtaPriority, 100_u32.to_ne_bytes().to_vec()),
+                        (
+                            NlaType::RtaOIF,
+                            unsafe { if_nametoindex(self.c_ifname()?.as_ptr()) }
+                                .to_ne_bytes()
+                                .to_vec(),
+                        ),
+                    ])?;
+
+                    let msg_buf_len: usize = (rust_nlmsg_align((NLMSG_HDR_SZ + RTMMSG_SZ) as u32)
+                        as usize)
+                        + (rust_nla_align(nlas.len() as i32) as usize);
+
+                    let nh = nlmsghdr {
+                        nlmsg_len: msg_buf_len as u32,
+                        nlmsg_type: nlmsg_type as u16,
+                        nlmsg_flags: (NLM_F_REQUEST | NLM_F_ACK | NLM_F_EXCL | NLM_F_CREATE) as u16,
+                        nlmsg_seq: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map_err(errstring)?
+                            .as_secs() as u32,
+                        nlmsg_pid: 0,
+                    };
+
+                    let mut v = Vec::new();
+                    v.append(&mut nh.pack().map_err(errstring)?.to_vec());
+                    v.append(&mut rt.pack().map_err(errstring)?.to_vec());
+                    v.append(&mut nlas);
+
+                    v
+                }
+                NlmsgType::RtmAddRoute => {
+                    let rt = rtmsg {
+                        rtm_family: AF_INET as u8,
+                        rtm_dst_len: self.ip4_cidr(),
+                        rtm_src_len: 0,
+                        rtm_tos: 0,
+                        rtm_table: RT_TABLE_MAIN,
+
+                        rtm_protocol: protocol,
+                        rtm_scope: scope,
+                        rtm_type: RTN_UNICAST,
+
+                        rtm_flags: 0,
+                    };
+
+                    let mut nlas = create_nlattrs(vec![
+                        (
+                            NlaType::RtaDestination,
+                            self.ip4_net_addr
+                                .unwrap()
+                                .as_sockaddr_in()
+                                .unwrap()
+                                .ip()
+                                .to_be_bytes()
+                                .to_vec(),
+                        ),
+                        (
+                            NlaType::RtaPrefSource,
+                            self.ip4_host_addr
+                                .unwrap()
+                                .as_sockaddr_in()
+                                .unwrap()
+                                .ip()
+                                .to_be_bytes()
+                                .to_vec(),
+                        ),
+                        (NlaType::RtaPriority, 100_u32.to_ne_bytes().to_vec()),
+                        (
+                            NlaType::RtaOIF,
+                            unsafe { if_nametoindex(self.c_ifname()?.as_ptr()) }
+                                .to_ne_bytes()
+                                .to_vec(),
+                        ),
+                    ])?;
+
+                    let nla_pad = (rust_nla_align(nlas.len() as i32) as usize) - nlas.len();
+                    nlas.append(&mut vec![0; nla_pad]);
+
+                    let msg_buf_len: usize = (rust_nlmsg_align((NLMSG_HDR_SZ + RTMMSG_SZ) as u32)
+                        as usize)
+                        + (rust_nla_align(nlas.len() as i32) as usize);
+
+                    let nh = nlmsghdr {
+                        nlmsg_len: msg_buf_len as u32,
+                        nlmsg_type: nlmsg_type as u16,
+                        nlmsg_flags: (NLM_F_REQUEST | NLM_F_ACK | NLM_F_EXCL | NLM_F_CREATE) as u16,
+                        nlmsg_seq: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map_err(errstring)?
+                            .as_secs() as u32,
+                        nlmsg_pid: 0,
+                    };
+
+                    let mut v = Vec::new();
+                    v.append(&mut nh.pack().map_err(errstring)?.to_vec());
+                    v.append(&mut rt.pack().map_err(errstring)?.to_vec());
+                    v.append(&mut nlas);
+
+                    v
+                }
+                _ => vec![],
             };
 
-            let rt = rtmsg {
-                rtm_family: AF_INET as u8,
-                rtm_dst_len: 0,
-                rtm_src_len: 0,
-                rtm_tos: 0,
-                rtm_table: RT_TABLE_UNSPEC,
-
-                rtm_protocol: RTPROT_UNSPEC,
-                rtm_scope: RT_SCOPE_UNIVERSE,
-                rtm_type: RTN_UNSPEC,
-
-                rtm_flags: 0,
-            };
-
-            const NLA: nlattr = nlattr {
-                nla_len: 8,
-                nla_type: RTA_TABLE,
-            };
-
-            const PAYLOAD_SZ: usize = (NLA.nla_len - NLA_SZ as u16) as usize;
-            let mut payload = ByteBuffer::<PAYLOAD_SZ>::new();
-            payload.build([RT_TABLE_MAIN])?;
-
-            let nl_term = nlmsghdr::default();
-
-            const TOTAL_BUF_LEN: usize = MSG_BUF_LEN + NLMSG_HDR_SZ;
-
-            let mut bb = ByteBuffer::<TOTAL_BUF_LEN>::new();
-
-            bb.build(nh.pack().map_err(errstring)?)?;
-            bb.build(rt.pack().map_err(errstring)?)?;
-            bb.build(NLA.pack().map_err(errstring)?)?;
-            bb.build(*payload.gib_buf())?;
-            bb.build(nl_term.pack().map_err(errstring)?)?;
-
-            let buff = bb.gib_buf();
+            if v.is_empty() {
+                return Err(String::from(format!(
+                    "Unable to create request of type {:?}",
+                    nlmsg_type
+                )));
+            }
 
             const SLACK: usize = 3;
-
             checked_sendto(
                 sfd,
-                buff.as_ref() as *const _ as *const c_void,
-                buff.as_ref().len() * SLACK,
+                v.as_ptr() as *const _ as *const c_void,
+                v.len() * SLACK,
                 0,
             )?;
 
@@ -755,7 +1028,12 @@ pub mod nic {
                 mem::size_of::<sockaddr_nl>() as u32,
             )?;
 
-            self.send_request(sfd, RTM_GETROUTE)?;
+            self.send_request(
+                sfd,
+                NlmsgType::RtmGetRoute,
+                RTPROT_UNSPEC,
+                RT_SCOPE_UNIVERSE,
+            )?;
 
             let mut nlmsgbuf = ByteBuffer::<8192>::new();
 
