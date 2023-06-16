@@ -17,10 +17,118 @@ pub const U16_SZ: usize = mem::size_of::<u16>();
 
 #[macro_export]
 macro_rules! trust_fall {
-        ($($e:expr)+) => {
-            unsafe { $($e)+ }
-        };
-    }
+    ($e:expr) => {
+        unsafe { $e }
+    };
+}
+
+macro_rules! write_impl {
+    () => {
+        fn build<const BUF_LEN: usize>(
+            &mut self,
+            added_buf: [u8; BUF_LEN],
+        ) -> Result<&mut Self, String> {
+            if self.build_idx + added_buf.len() > self.buf.len() {
+                return Err(String::from("Exceeded buffer capacity"));
+            } else {
+                for byte in added_buf {
+                    self.buf[self.build_idx] = byte;
+                    self.build_idx += 1;
+                }
+            }
+            Ok(self)
+        }
+
+        fn buf_mut_ptr(&mut self) -> *mut u8 {
+            self.buf.as_mut_ptr()
+        }
+
+        fn idx(&self) -> usize {
+            self.current_idx
+        }
+
+        fn incr(&mut self, num_bytes: usize) {
+            self.current_idx += num_bytes
+        }
+
+        fn ptr(&self) -> *const u8 {
+            self.buf.as_ptr()
+        }
+
+        fn ptr_cast<T>(&mut self) -> Result<*const T, String> {
+            let bytes = mem::size_of::<T>();
+            if self.current_idx + bytes > self.build_idx {
+                return Err(String::from(format!(
+                    "No data beyond idx {} to cast",
+                    self.build_idx
+                )));
+            }
+            let ok = Ok((unsafe { self.buf.as_ptr().add(self.current_idx) }) as *const T);
+            self.current_idx += bytes;
+            ok
+        }
+
+        fn reset(&mut self) -> &mut Self {
+            self.current_idx = 0;
+            self
+        }
+
+        fn sz(&self) -> usize {
+            self.buf.len()
+        }
+
+        fn transmute_to<T: Copy>(&mut self) -> Result<Box<T>, String> {
+            let pt = self.ptr_cast::<T>()?;
+
+            Ok(Box::<T>::new(unsafe { *pt }))
+        }
+
+        fn take_buf<const NUM_BYTES: usize>(&mut self) -> Result<[u8; NUM_BYTES], String> {
+            let end_idx = self.current_idx + NUM_BYTES;
+            if end_idx > self.buf.len() {
+                return Err(String::from("End index exceeds buffer"));
+            }
+
+            let mut scratch: [u8; NUM_BYTES] = [0; NUM_BYTES];
+
+            for (i, byte) in self.buf[self.current_idx..end_idx].iter().enumerate() {
+                scratch[i] = *byte;
+            }
+
+            self.current_idx += NUM_BYTES;
+            Ok(scratch)
+        }
+
+        fn take_vec(&mut self, num_bytes: usize) -> Result<Vec<u8>, String> {
+            let end_idx = self.current_idx + num_bytes;
+            if end_idx > self.buf.len() {
+                return Err(String::from("End index exceeds buffer"));
+            }
+
+            let mut scratch = Vec::new();
+
+            for byte in self.buf[self.current_idx..end_idx].iter() {
+                scratch.push(*byte);
+            }
+
+            self.current_idx += num_bytes;
+            Ok(scratch)
+        }
+    };
+}
+
+macro_rules! impl_buff {
+    ($buf_sz:ident $struct_name:ident) => {
+        impl<const $buf_sz: usize> Buffer for $struct_name<$buf_sz> {
+            write_impl!();
+        }
+    };
+    ($struct_name:ident) => {
+        impl Buffer for $struct_name {
+            write_impl!();
+        }
+    };
+}
 
 pub fn transmute_vec<const NUM_BYTES: usize>(v: Vec<u8>) -> Result<[u8; NUM_BYTES], String> {
     let mut scratch = [0; NUM_BYTES];
@@ -209,7 +317,7 @@ pub fn create_nlattrs(nla_data: Vec<(NlaType, Vec<u8>)>) -> Result<Vec<u8>, Stri
     Ok(v)
 }
 
-pub fn create_nlmsg(sa: &mut sockaddr_nl, msgbuf: &mut ByteVec) -> msghdr {
+pub fn create_nlmsg<B: Buffer>(sa: &mut sockaddr_nl, msgbuf: &mut B) -> msghdr {
     let mut iov = iovec {
         iov_base: msgbuf.buf_mut_ptr() as *mut c_void,
         iov_len: msgbuf.sz(),
@@ -228,6 +336,33 @@ pub fn create_nlmsg(sa: &mut sockaddr_nl, msgbuf: &mut ByteVec) -> msghdr {
     mhdr
 }
 
+pub trait Buffer {
+    fn build<const BUF_LEN: usize>(
+        &mut self,
+        added_buf: [u8; BUF_LEN],
+    ) -> Result<&mut Self, String>;
+
+    fn buf_mut_ptr(&mut self) -> *mut u8;
+
+    fn idx(&self) -> usize;
+
+    fn incr(&mut self, num_bytes: usize);
+
+    fn ptr(&self) -> *const u8;
+
+    fn ptr_cast<T>(&mut self) -> Result<*const T, String>;
+
+    fn transmute_to<T: Copy>(&mut self) -> Result<Box<T>, String>;
+
+    fn reset(&mut self) -> &mut Self;
+
+    fn sz(&self) -> usize;
+
+    fn take_buf<const NUM_BYTES: usize>(&mut self) -> Result<[u8; NUM_BYTES], String>;
+
+    fn take_vec(&mut self, num_bytes: usize) -> Result<Vec<u8>, String>;
+}
+
 #[derive(Debug)]
 pub struct ByteBuffer<const TOTAL_SZ: usize> {
     current_idx: usize,
@@ -243,98 +378,9 @@ impl<const TOTAL_SZ: usize> ByteBuffer<TOTAL_SZ> {
             buf: [0; TOTAL_SZ],
         }
     }
-
-    pub fn build<const BUF_LEN: usize>(
-        &mut self,
-        added_buf: [u8; BUF_LEN],
-    ) -> Result<&mut Self, String> {
-        if self.build_idx + added_buf.len() > TOTAL_SZ {
-            return Err(String::from("Exceeded buffer capacity"));
-        } else {
-            for byte in added_buf {
-                self.buf[self.build_idx] = byte;
-                self.build_idx += 1;
-            }
-        }
-        Ok(self)
-    }
-
-    pub fn buf_mut_ptr(&mut self) -> *mut u8 {
-        self.buf.as_mut_ptr()
-    }
-
-    pub fn idx(&self) -> usize {
-        self.current_idx
-    }
-
-    pub fn incr(&mut self, num_bytes: usize) {
-        self.current_idx += num_bytes
-    }
-
-    pub fn ptr(&self) -> *const u8 {
-        self.buf.as_ptr()
-    }
-
-    pub fn ptr_cast<T>(&mut self) -> Result<*const T, String> {
-        let bytes = mem::size_of::<T>();
-        if self.current_idx + bytes > TOTAL_SZ {
-            return Err(String::from("ptr ran off the highway"));
-        }
-        let ok = Ok(unsafe { self.buf.as_ptr().offset(self.current_idx as isize) } as *const T);
-        self.current_idx += bytes;
-        ok
-    }
-
-    pub fn transmute_to<T: Copy>(&mut self) -> Result<T, String> {
-        let pt = self.ptr_cast::<T>()?;
-
-        Ok(unsafe { *pt })
-    }
-
-    pub fn gib_buf(&self) -> &[u8; TOTAL_SZ] {
-        &self.buf
-    }
-
-    pub fn reset(&mut self) {
-        self.current_idx = 0
-    }
-
-    pub const fn sz(&self) -> usize {
-        TOTAL_SZ
-    }
-
-    pub fn take_buf<const NUM_BYTES: usize>(&mut self) -> Result<[u8; NUM_BYTES], String> {
-        let end_idx = self.current_idx + NUM_BYTES;
-        if end_idx > TOTAL_SZ {
-            return Err(String::from("End index exceeds buffer"));
-        }
-
-        let mut scratch: [u8; NUM_BYTES] = [0; NUM_BYTES];
-
-        for (i, byte) in self.buf[self.current_idx..end_idx].iter().enumerate() {
-            scratch[i] = *byte;
-        }
-
-        self.current_idx += NUM_BYTES;
-        Ok(scratch)
-    }
-
-    pub fn take_vec(&mut self, num_bytes: usize) -> Result<Vec<u8>, String> {
-        let end_idx = self.current_idx + num_bytes;
-        if end_idx > TOTAL_SZ {
-            return Err(String::from("End index exceeds buffer"));
-        }
-
-        let mut scratch = Vec::new();
-
-        for byte in self.buf[self.current_idx..end_idx].iter() {
-            scratch.push(*byte);
-        }
-
-        self.current_idx += num_bytes;
-        Ok(scratch)
-    }
 }
+
+impl_buff!(TOTAL_SZ ByteBuffer);
 
 #[derive(Debug)]
 pub struct ByteVec {
@@ -351,102 +397,9 @@ impl ByteVec {
             buf: vec![0; len],
         }
     }
-
-    pub fn build<const BUF_LEN: usize>(
-        &mut self,
-        added_buf: [u8; BUF_LEN],
-    ) -> Result<&mut Self, String> {
-        if self.build_idx + added_buf.len() > self.buf.len() {
-            return Err(String::from("Exceeded buffer capacity"));
-        } else {
-            for byte in added_buf {
-                self.buf[self.build_idx] = byte;
-                self.build_idx += 1;
-            }
-        }
-        Ok(self)
-    }
-
-    pub fn buf_mut_ptr(&mut self) -> *mut u8 {
-        self.buf.as_mut_ptr()
-    }
-
-    pub fn idx(&self) -> usize {
-        self.current_idx
-    }
-
-    pub fn incr(&mut self, num_bytes: usize) {
-        self.current_idx += num_bytes
-    }
-
-    pub fn ptr(&self) -> *const u8 {
-        self.buf.as_ptr()
-    }
-
-    pub fn ptr_cast<T>(&mut self) -> Result<*const T, String> {
-        let bytes = mem::size_of::<T>();
-        if self.current_idx + bytes > self.build_idx {
-            return Err(String::from(format!(
-                "No data beyond idx {} to cast",
-                self.build_idx
-            )));
-        }
-        let ok = Ok((unsafe { self.buf.as_ptr().add(self.current_idx) }) as *const T);
-        self.current_idx += bytes;
-        ok
-    }
-
-    pub fn gib_buf<const SZ: usize>(&self) -> &Vec<u8> {
-        &self.buf
-    }
-
-    pub fn reset(&mut self) -> &mut Self {
-        self.current_idx = 0;
-        self
-    }
-
-    pub fn sz(&self) -> usize {
-        self.buf.len()
-    }
-
-    pub fn transmute_to<T: Copy>(&mut self) -> Result<T, String> {
-        let pt = self.ptr_cast::<T>()?;
-
-        Ok(unsafe { *pt })
-    }
-
-    pub fn take_buf<const NUM_BYTES: usize>(&mut self) -> Result<[u8; NUM_BYTES], String> {
-        let end_idx = self.current_idx + NUM_BYTES;
-        if end_idx > self.buf.len() {
-            return Err(String::from("End index exceeds buffer"));
-        }
-
-        let mut scratch: [u8; NUM_BYTES] = [0; NUM_BYTES];
-
-        for (i, byte) in self.buf[self.current_idx..end_idx].iter().enumerate() {
-            scratch[i] = *byte;
-        }
-
-        self.current_idx += NUM_BYTES;
-        Ok(scratch)
-    }
-
-    pub fn take_vec(&mut self, num_bytes: usize) -> Result<Vec<u8>, String> {
-        let end_idx = self.current_idx + num_bytes;
-        if end_idx > self.buf.len() {
-            return Err(String::from("End index exceeds buffer"));
-        }
-
-        let mut scratch = Vec::new();
-
-        for byte in self.buf[self.current_idx..end_idx].iter() {
-            scratch.push(*byte);
-        }
-
-        self.current_idx += num_bytes;
-        Ok(scratch)
-    }
 }
+
+impl_buff!(ByteVec);
 
 #[cfg(test)]
 mod tests {
@@ -653,7 +606,7 @@ mod tests {
 
         let msg = bb.transmute_to::<nlmsghdr>().unwrap();
 
-        assert_eq!(n, msg)
+        assert_eq!(n, *(msg.as_ref()))
     }
 
     #[test]
@@ -699,6 +652,6 @@ mod tests {
 
         let msg = bb.transmute_to::<nlmsghdr>().unwrap();
 
-        assert_eq!(n, msg)
+        assert_eq!(n, *(msg.as_ref()))
     }
 }

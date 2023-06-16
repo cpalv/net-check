@@ -20,14 +20,17 @@ use packed_struct::prelude::PackedStruct;
 
 use crate::netlink::{
     create_nlattrs, create_nlmsg, nlattr, nlmsghdr, rtmsg, rust_is_nlmsg_aligned, rust_nlmsg_align,
-    transmute_vec, ByteVec, NlaType, NlmsgType, RtScope, RtmProtocol, RtnType, NLA_SZ,
-    NLMSG_HDR_SZ, RTMMSG_SZ, U32_SZ,
+    transmute_vec, Buffer, ByteBuffer, ByteVec, NlaType, NlmsgType, RtScope, RtmProtocol, RtnType,
+    NLA_SZ, NLMSG_HDR_SZ, RTMMSG_SZ, U32_SZ,
 };
 
 const KB: usize = 1024;
 const MB: usize = 1024 * KB;
 const GB: usize = 1024 * MB;
 const TB: usize = 1024 * GB;
+
+const BUF_SZ: usize = 8 * KB;
+const SLACK: usize = 3;
 
 fn errstring<E: ToString>(err: E) -> String {
     format!("{}:{} {}", file!(), line!(), err.to_string())
@@ -121,8 +124,42 @@ fn recv_nlmsg(sfd: i32, mhdr: *mut msghdr, flags: i32) -> Result<usize, RecvErr>
     Ok(len as usize)
 }
 
+#[derive(Debug, Clone, Copy)]
+enum NlaPolicyError {
+    Invalid,
+}
+
+impl fmt::Display for NlaPolicyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid => write!(f, "NLA is invalid"),
+        }
+    }
+}
+
+trait NlaPolicyValidator {
+    fn validate(&self, nla: &nlattr) -> Result<(), NlaPolicyError>;
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NlaPolicy {
+    max_len: usize,
+}
+
+impl NlaPolicyValidator for NlaPolicy {
+    fn validate(&self, nla: &nlattr) -> Result<(), NlaPolicyError> {
+        if (nla.nla_len as usize) > self.max_len {
+            return Err(NlaPolicyError::Invalid);
+        }
+        Ok(())
+    }
+}
+
 // https://man7.org/linux/man-pages/man7/netlink.7.html#EXAMPLES
-fn parse_msg(nlmsgbuf: &mut ByteVec) -> Result<Route, String> {
+fn parse_msg<F: Sized, B: Buffer>(nlmsgbuf: &mut B, nlavp: Option<&F>) -> Result<Route, String>
+where
+    F: NlaPolicyValidator,
+{
     let nlhr = nlmsghdr::unpack(&nlmsgbuf.take_buf::<NLMSG_HDR_SZ>()?).map_err(errstring)?;
     let rtm = rtmsg::unpack(&nlmsgbuf.take_buf::<RTMMSG_SZ>()?).map_err(errstring)?;
 
@@ -138,6 +175,10 @@ fn parse_msg(nlmsgbuf: &mut ByteVec) -> Result<Route, String> {
 
     while remaining_msg_bytes > 0 {
         let nla = nlattr::unpack(&nlmsgbuf.take_buf::<NLA_SZ>()?).map_err(errstring)?;
+
+        if nlavp.is_some() {
+            nlavp.unwrap().validate(&nla).map_err(errstring)?;
+        }
 
         let remaining_nla_bytes = (nla.nla_len - (NLA_SZ as u16)) as usize;
 
@@ -386,7 +427,6 @@ impl NetworkInterface {
         };
 
         let sfd = quick_socket(AF_INET, SOCK_DGRAM, IPPROTO_IP)?;
-
         unsafe {
             if ioctl(sfd, SIOCGIFFLAGS, &ifr) < 0 {
                 return Err(Error::last_os_error().to_string());
@@ -398,7 +438,6 @@ impl NetworkInterface {
                 return Err(Error::last_os_error().to_string());
             }
         }
-
         rust_close(sfd)
     }
 
@@ -444,7 +483,6 @@ impl NetworkInterface {
             }
         };
 
-        const SLACK: usize = 3;
         if let Err(e) = checked_sendto(
             sfd,
             v.as_ptr() as *const _ as *const c_void,
@@ -473,7 +511,7 @@ impl NetworkInterface {
         }
 
         while msgbuf.idx() < rx_bytes.clone().ok().unwrap() {
-            let rt = match parse_msg(&mut msgbuf) {
+            let rt = match parse_msg::<NlaPolicy, ByteVec>(&mut msgbuf, None) {
                 Ok(route) => route,
                 Err(e) => {
                     eprintln!("error parsing message: {e}");
@@ -512,10 +550,12 @@ impl NetworkInterface {
             mem::size_of::<sockaddr_nl>() as u32,
         )?;
 
+        let flags = (NLM_F_REQUEST | NLM_F_ACK | NLM_F_EXCL | NLM_F_CREATE) as u16;
+
         let v = match (rtm_protocol, rtm_scope) {
             (RtmProtocol::Kernel, RtScope::Link) => self.create_rtrequest(
                 NlmsgType::RtmAddRoute,
-                (NLM_F_REQUEST | NLM_F_ACK | NLM_F_EXCL | NLM_F_CREATE) as u16,
+                flags,
                 self.ip4_cidr(),
                 RtnType::Unicast,
                 rtm_protocol,
@@ -547,7 +587,7 @@ impl NetworkInterface {
             )?,
             (RtmProtocol::Dhcp, RtScope::Universe) => self.create_rtrequest(
                 NlmsgType::RtmAddRoute,
-                (NLM_F_REQUEST | NLM_F_ACK | NLM_F_EXCL | NLM_F_CREATE) as u16,
+                flags,
                 0,
                 RtnType::Unicast,
                 rtm_protocol,
@@ -587,7 +627,6 @@ impl NetworkInterface {
             )));
         }
 
-        const SLACK: usize = 3;
         checked_sendto(
             sfd,
             v.as_ptr() as *const _ as *const c_void,
@@ -612,7 +651,7 @@ impl NetworkInterface {
         }
 
         while msgbuf.idx() < rx_bytes.clone().ok().unwrap() {
-            parse_msg(&mut msgbuf)?;
+            parse_msg::<NlaPolicy, ByteVec>(&mut msgbuf, None)?;
         }
 
         rust_close(sfd)
@@ -704,7 +743,6 @@ impl NetworkInterface {
             )));
         }
 
-        const SLACK: usize = 3;
         checked_sendto(
             sfd,
             v.as_ptr() as *const _ as *const c_void,
@@ -712,24 +750,13 @@ impl NetworkInterface {
             0,
         )?;
 
-        let mut msgbuf = ByteVec::new(8192);
+        let mut msgbuf = ByteBuffer::<BUF_SZ>::new();
         let mut mhdr = create_nlmsg(&mut sa, &mut msgbuf);
 
-        let mut rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC);
+        let rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC).map_err(errstring)?;
 
-        while let Err(e) = rx_bytes {
-            if msgbuf.sz() > 1 * TB {
-                return Err(String::from(format!("Ok.. thats enough: {e}")));
-            }
-            let new_buf_sz = msgbuf.sz() * 4;
-            msgbuf = ByteVec::new(new_buf_sz);
-            mhdr = create_nlmsg(&mut sa, &mut msgbuf);
-
-            rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC);
-        }
-
-        while msgbuf.idx() < rx_bytes.clone().ok().unwrap() {
-            parse_msg(&mut msgbuf)?;
+        while msgbuf.idx() < rx_bytes {
+            parse_msg::<NlaPolicy, ByteBuffer<BUF_SZ>>(&mut msgbuf, None)?;
         }
 
         rust_close(sfd)
@@ -819,7 +846,6 @@ impl NetworkInterface {
             vec![(NlaType::RtaTable, vec![RT_TABLE_MAIN])],
         )?;
 
-        const SLACK: usize = 3;
         checked_sendto(
             sfd,
             v.as_ptr() as *const _ as *const c_void,
@@ -827,26 +853,30 @@ impl NetworkInterface {
             0,
         )?;
 
-        const BUF_SZ: usize = 64;
         let mut msgbuf = ByteVec::new(BUF_SZ);
         let mut mhdr = create_nlmsg(&mut sa, &mut msgbuf);
 
         let mut rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC);
 
         while let Err(e) = rx_bytes {
-            if msgbuf.sz() > 1 * TB {
-                return Err(String::from(format!("Ok.. thats enough: {e}")));
-            }
-            let new_buf_sz = msgbuf.sz() * 4;
-            msgbuf = ByteVec::new(new_buf_sz);
-            mhdr = create_nlmsg(&mut sa, &mut msgbuf);
+            match e {
+                RecvErr::OsErr(s) => return Err(s),
+                RecvErr::MsgTrunc => {
+                    if msgbuf.sz() > 1 * TB {
+                        return Err(String::from(format!("Ok.. thats enough: {e}")));
+                    }
+                    let new_buf_sz = msgbuf.sz() * 4;
+                    msgbuf = ByteVec::new(new_buf_sz);
+                    mhdr = create_nlmsg(&mut sa, &mut msgbuf);
 
-            rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC);
+                    rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC);
+                }
+            }
         }
 
         let mut i = 0;
         while msgbuf.idx() < rx_bytes.clone().ok().unwrap() {
-            let rt = parse_msg(&mut msgbuf)?;
+            let rt = parse_msg::<NlaPolicy, ByteVec>(&mut msgbuf, None)?;
             println!("Route {i}: {:?}", rt);
             i += 1;
         }
