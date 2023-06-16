@@ -24,6 +24,11 @@ use crate::netlink::{
     NLMSG_HDR_SZ, RTMMSG_SZ, U32_SZ,
 };
 
+const KB: usize = 1024;
+const MB: usize = 1024 * KB;
+const GB: usize = 1024 * MB;
+const TB: usize = 1024 * GB;
+
 fn errstring<E: ToString>(err: E) -> String {
     format!("{}:{} {}", file!(), line!(), err.to_string())
 }
@@ -79,10 +84,38 @@ fn checked_sendto(sfd: i32, buf: *const c_void, buf_len: usize, flags: i32) -> R
     Ok(())
 }
 
-fn recv_nlmsg(sfd: i32, mhdr: *mut msghdr, flags: i32) -> Result<usize, String> {
+#[derive(Debug, Clone)]
+enum RecvErr {
+    OsErr(String),
+    MsgTrunc,
+}
+
+impl fmt::Display for RecvErr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OsErr(s) => write!(f, "{s}"),
+            Self::MsgTrunc => write!(f, "Message truncated"),
+        }
+    }
+}
+
+/*impl std::error::Error for RecvErr {
+    fn description(&self) -> &str {
+        match self {
+            Self::OsErr(s) => s,
+            Self::MsgTrunc => "Message truncated",
+        }
+    }
+}*/
+
+fn recv_nlmsg(sfd: i32, mhdr: *mut msghdr, flags: i32) -> Result<usize, RecvErr> {
     let len = unsafe { recvmsg(sfd, mhdr, flags) };
     if len < 0 {
-        return Err(Error::last_os_error().to_string());
+        return Err(RecvErr::OsErr(Error::last_os_error().to_string()));
+    }
+
+    if unsafe { (*mhdr).msg_flags } == MSG_TRUNC {
+        return Err(RecvErr::MsgTrunc);
     }
 
     Ok(len as usize)
@@ -425,29 +458,21 @@ impl NetworkInterface {
         let mut msgbuf = ByteVec::new(8192);
         let mut mhdr = create_nlmsg(&mut sa, &mut msgbuf);
 
-        let mut rx_bytes = match recv_nlmsg(sfd, &mut mhdr, 0) {
-            Ok(received_bytes) => received_bytes,
-            Err(e) => {
-                eprintln!("error on receive msg: {e}");
+        let mut rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC);
+
+        while let Err(e) = rx_bytes {
+            if msgbuf.sz() > 1 * TB {
+                eprintln!("Ok.. thats enough: {e}");
                 return self;
             }
-        };
-
-        while mhdr.msg_flags == MSG_TRUNC {
             let new_buf_sz = msgbuf.sz() * 4;
             msgbuf = ByteVec::new(new_buf_sz);
             mhdr = create_nlmsg(&mut sa, &mut msgbuf);
 
-            rx_bytes = match recv_nlmsg(sfd, &mut mhdr, 0) {
-                Ok(received_bytes) => received_bytes,
-                Err(e) => {
-                    eprintln!("error on receive msg: {e}");
-                    return self;
-                }
-            };
+            rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC);
         }
 
-        while msgbuf.idx() < rx_bytes {
+        while msgbuf.idx() < rx_bytes.clone().ok().unwrap() {
             let rt = match parse_msg(&mut msgbuf) {
                 Ok(route) => route,
                 Err(e) => {
@@ -573,17 +598,20 @@ impl NetworkInterface {
         let mut msgbuf = ByteVec::new(8192);
         let mut mhdr = create_nlmsg(&mut sa, &mut msgbuf);
 
-        let mut rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC)?;
+        let mut rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC);
 
-        while mhdr.msg_flags == MSG_TRUNC {
+        while let Err(e) = rx_bytes {
+            if msgbuf.sz() > 1 * TB {
+                return Err(String::from(format!("Ok.. thats enough: {e}")));
+            }
             let new_buf_sz = msgbuf.sz() * 4;
             msgbuf = ByteVec::new(new_buf_sz);
             mhdr = create_nlmsg(&mut sa, &mut msgbuf);
 
-            rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC)?;
+            rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC);
         }
 
-        while msgbuf.idx() < rx_bytes {
+        while msgbuf.idx() < rx_bytes.clone().ok().unwrap() {
             parse_msg(&mut msgbuf)?;
         }
 
@@ -687,17 +715,20 @@ impl NetworkInterface {
         let mut msgbuf = ByteVec::new(8192);
         let mut mhdr = create_nlmsg(&mut sa, &mut msgbuf);
 
-        let mut rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC)?;
+        let mut rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC);
 
-        while mhdr.msg_flags == MSG_TRUNC {
+        while let Err(e) = rx_bytes {
+            if msgbuf.sz() > 1 * TB {
+                return Err(String::from(format!("Ok.. thats enough: {e}")));
+            }
             let new_buf_sz = msgbuf.sz() * 4;
             msgbuf = ByteVec::new(new_buf_sz);
             mhdr = create_nlmsg(&mut sa, &mut msgbuf);
 
-            rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC)?;
+            rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC);
         }
 
-        while msgbuf.idx() < rx_bytes {
+        while msgbuf.idx() < rx_bytes.clone().ok().unwrap() {
             parse_msg(&mut msgbuf)?;
         }
 
@@ -800,18 +831,21 @@ impl NetworkInterface {
         let mut msgbuf = ByteVec::new(BUF_SZ);
         let mut mhdr = create_nlmsg(&mut sa, &mut msgbuf);
 
-        let mut rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC)?;
+        let mut rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC);
 
-        while mhdr.msg_flags == MSG_TRUNC {
+        while let Err(e) = rx_bytes {
+            if msgbuf.sz() > 1 * TB {
+                return Err(String::from(format!("Ok.. thats enough: {e}")));
+            }
             let new_buf_sz = msgbuf.sz() * 4;
             msgbuf = ByteVec::new(new_buf_sz);
             mhdr = create_nlmsg(&mut sa, &mut msgbuf);
 
-            rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC)?;
+            rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC);
         }
 
         let mut i = 0;
-        while msgbuf.idx() < rx_bytes {
+        while msgbuf.idx() < rx_bytes.clone().ok().unwrap() {
             let rt = parse_msg(&mut msgbuf)?;
             println!("Route {i}: {:?}", rt);
             i += 1;
