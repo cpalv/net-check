@@ -3,7 +3,7 @@ use core::fmt;
 use std::ffi::c_void;
 use std::io::Error;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use std::{mem, ptr, thread};
 
 use nix::ifaddrs::{self, InterfaceAddress};
@@ -19,9 +19,9 @@ use nix::sys::socket::{AddressFamily, SockaddrLike, SockaddrStorage};
 use packed_struct::prelude::PackedStruct;
 
 use crate::netlink::{
-    create_nlattrs, create_nlmsg, nlattr, nlmsghdr, rtmsg, rust_is_nlmsg_aligned, rust_nlmsg_align,
-    transmute_vec, Buffer, ByteBuffer, ByteVec, NlaType, NlmsgType, RtScope, RtmProtocol, RtnType,
-    NLA_SZ, NLMSG_HDR_SZ, RTMMSG_SZ, U32_SZ,
+    create_nlmsg, create_rtrequest, nlattr, nlmsghdr, rtmsg, transmute_vec, Buffer, ByteBuffer,
+    ByteVec, NlaType, NlmsgType, RtScope, RtmProtocol, RtnType, NLA_SZ, NLMSG_HDR_SZ, RTMMSG_SZ,
+    U32_SZ,
 };
 
 const KB: usize = 1024;
@@ -32,8 +32,15 @@ const TB: usize = 1024 * GB;
 const BUF_SZ: usize = 8 * KB;
 const SLACK: usize = 3;
 
-fn errstring<E: ToString>(err: E) -> String {
+pub fn errstring<E: ToString>(err: E) -> String {
     format!("{}:{} {}", file!(), line!(), err.to_string())
+}
+
+#[macro_export]
+macro_rules! map_err_str {
+    ($e:expr) => {
+        $e.map_err($crate::nic::errstring)
+    };
 }
 
 #[derive(Debug)]
@@ -102,15 +109,6 @@ impl fmt::Display for RecvErr {
     }
 }
 
-/*impl std::error::Error for RecvErr {
-    fn description(&self) -> &str {
-        match self {
-            Self::OsErr(s) => s,
-            Self::MsgTrunc => "Message truncated",
-        }
-    }
-}*/
-
 fn recv_nlmsg(sfd: i32, mhdr: *mut msghdr, flags: i32) -> Result<usize, RecvErr> {
     let len = unsafe { recvmsg(sfd, mhdr, flags) };
     if len < 0 {
@@ -156,22 +154,23 @@ impl NlaPolicyValidator for NlaPolicy {
 }
 
 // https://man7.org/linux/man-pages/man7/netlink.7.html#EXAMPLES
-fn parse_msg<F: Sized, B: Buffer>(nlmsgbuf: &mut B, nlavp: Option<&F>) -> Result<Route, String>
-where
-    F: NlaPolicyValidator,
-{
+fn parse_msg<F: Sized + NlaPolicyValidator, B: Buffer>(
+    nlmsgbuf: &mut B,
+    nlavp: Option<&F>,
+) -> Result<Route, String> {
     let nlhr = nlmsghdr::unpack(&nlmsgbuf.take_buf::<NLMSG_HDR_SZ>()?).map_err(errstring)?;
     let rtm = rtmsg::unpack(&nlmsgbuf.take_buf::<RTMMSG_SZ>()?).map_err(errstring)?;
 
     // parse remaining nlattr structs
-    let msg_bytes = nlhr.nlmsg_len as isize;
-    let mut remaining_msg_bytes = msg_bytes - ((NLMSG_HDR_SZ + RTMMSG_SZ) as isize);
+    let msg_bytes = nlhr.nlmsg_len as i64;
+    let mut remaining_msg_bytes = msg_bytes - ((NLMSG_HDR_SZ + RTMMSG_SZ) as i64);
 
-    let mut rt = Route::default();
-
-    rt.scope = rtm.rtm_scope;
-    rt.table = rtm.rtm_table;
-    rt.protocol = rtm.rtm_protocol;
+    let mut rt = Route {
+        scope: rtm.rtm_scope,
+        table: rtm.rtm_table,
+        protocol: rtm.rtm_protocol,
+        ..Default::default()
+    };
 
     while remaining_msg_bytes > 0 {
         let nla = nlattr::unpack(&nlmsgbuf.take_buf::<NLA_SZ>()?).map_err(errstring)?;
@@ -180,14 +179,14 @@ where
             nlavp.unwrap().validate(&nla).map_err(errstring)?;
         }
 
-        let remaining_nla_bytes = (nla.nla_len - (NLA_SZ as u16)) as usize;
+        let remaining_nla_bytes = (nla.nla_len - map_err_str!(u16::try_from(NLA_SZ))?) as usize;
 
         match nla.nla_type {
             RTA_TABLE => {
-                rt.table = *nlmsgbuf.take_vec(remaining_nla_bytes)?.get(0).unwrap();
+                rt.table = *nlmsgbuf.take_vec(remaining_nla_bytes)?.first().unwrap();
             }
             RTA_PRIORITY => {
-                rt.rt_priority = *nlmsgbuf.take_vec(remaining_nla_bytes)?.get(0).unwrap();
+                rt.rt_priority = *nlmsgbuf.take_vec(remaining_nla_bytes)?.first().unwrap();
             }
             RTA_GATEWAY => {
                 let octets = transmute_vec::<U32_SZ>(nlmsgbuf.take_vec(remaining_nla_bytes)?)?;
@@ -205,7 +204,7 @@ where
             _ => nlmsgbuf.incr(remaining_nla_bytes),
         }
 
-        remaining_msg_bytes -= nla.nla_len as isize;
+        remaining_msg_bytes -= i64::from(nla.nla_len);
     }
 
     Ok(rt)
@@ -262,7 +261,7 @@ pub fn get_nics() -> Vec<NetworkInterface> {
                                 acc.ip6_netmasks.push(ia.netmask);
                             }
                             Some(AddressFamily::Packet) => {
-                                acc.ether = address.to_string().to_uppercase()
+                                acc.ether = address.to_string().to_uppercase();
                             }
                             _ => println!("unsupported address type"),
                         }
@@ -374,12 +373,12 @@ impl fmt::Display for NetworkInterface {
 impl NetworkInterface {
     fn c_ifname(&self) -> Result<[i8; IFNAMSIZ], String> {
         let mut ifname: [i8; IFNAMSIZ] = [0; IFNAMSIZ];
-        if self.name.chars().collect::<Vec<char>>().len() > IFNAMSIZ {
-            return Err(String::from(format!(
+        if self.name.chars().count() > IFNAMSIZ {
+            return Err(format!(
                 "{}:{} - Exceeded interface name buffer capacity",
                 file!(),
                 line!()
-            )));
+            ));
         }
 
         for (i, c) in self.name.chars().enumerate() {
@@ -388,7 +387,10 @@ impl NetworkInterface {
         Ok(ifname)
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn ip4_cidr(&self) -> u8 {
+        // the max number of bits in a 32-bit will
+        // not exceed the max value a u8 can represent
         self.ip4_netmask
             .unwrap()
             .as_sockaddr_in()
@@ -456,20 +458,38 @@ impl NetworkInterface {
             }
         };
         let mut sa: sockaddr_nl = unsafe { mem::zeroed() };
-        sa.nl_family = AF_NETLINK as u16;
+        sa.nl_family = match u16::try_from(AF_NETLINK) {
+            Ok(netlink) => netlink,
+            Err(e) => {
+                eprintln!("{e}");
+                return self;
+            }
+        };
 
-        if let Err(e) = checked_bind(
-            sfd,
-            &sa as *const _ as *const sockaddr,
-            mem::size_of::<sockaddr_nl>() as u32,
-        ) {
+        let stuct_size = match map_err_str!(u32::try_from(mem::size_of::<sockaddr_nl>())) {
+            Ok(size) => size,
+            Err(e) => {
+                eprintln!("{e}");
+                return self;
+            }
+        };
+
+        let flags = match u16::try_from(NLM_F_REQUEST | NLM_F_DUMP) {
+            Ok(flags) => flags,
+            Err(e) => {
+                eprintln!("{e}");
+                return self;
+            }
+        };
+
+        if let Err(e) = checked_bind(sfd, ptr::addr_of!(sa).cast::<sockaddr>(), stuct_size) {
             eprintln!("unable to bind to socket {sfd}: {e}");
             return self;
         }
 
-        let v = match self.create_rtrequest(
+        let v = match create_rtrequest(
             NlmsgType::RtmGetRoute,
-            (NLM_F_REQUEST | NLM_F_DUMP) as u16,
+            flags,
             0,
             RtnType::Unspecified,
             RtmProtocol::Unspecified,
@@ -483,12 +503,7 @@ impl NetworkInterface {
             }
         };
 
-        if let Err(e) = checked_sendto(
-            sfd,
-            v.as_ptr() as *const _ as *const c_void,
-            v.len() * SLACK,
-            0,
-        ) {
+        if let Err(e) = checked_sendto(sfd, v.as_ptr().cast::<c_void>(), v.len() * SLACK, 0) {
             eprintln!("error sending get route request: {e}");
             return self;
         }
@@ -499,7 +514,7 @@ impl NetworkInterface {
         let mut rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC);
 
         while let Err(e) = rx_bytes {
-            if msgbuf.sz() > 1 * TB {
+            if msgbuf.sz() > TB {
                 eprintln!("Ok.. thats enough: {e}");
                 return self;
             }
@@ -542,18 +557,20 @@ impl NetworkInterface {
     pub fn add_route(&self, rtm_protocol: RtmProtocol, rtm_scope: RtScope) -> Result<(), String> {
         let sfd = quick_socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)?;
         let mut sa: sockaddr_nl = unsafe { mem::zeroed() };
-        sa.nl_family = AF_NETLINK as u16;
+        sa.nl_family = map_err_str!(u16::try_from(AF_NETLINK))?;
 
         checked_bind(
             sfd,
-            &sa as *const _ as *const sockaddr,
-            mem::size_of::<sockaddr_nl>() as u32,
+            ptr::addr_of!(sa).cast::<sockaddr>(),
+            map_err_str!(u32::try_from(mem::size_of::<sockaddr_nl>()))?,
         )?;
 
-        let flags = (NLM_F_REQUEST | NLM_F_ACK | NLM_F_EXCL | NLM_F_CREATE) as u16;
+        let flags = map_err_str!(u16::try_from(
+            NLM_F_REQUEST | NLM_F_ACK | NLM_F_EXCL | NLM_F_CREATE
+        ))?;
 
         let v = match (rtm_protocol, rtm_scope) {
-            (RtmProtocol::Kernel, RtScope::Link) => self.create_rtrequest(
+            (RtmProtocol::Kernel, RtScope::Link) => create_rtrequest(
                 NlmsgType::RtmAddRoute,
                 flags,
                 self.ip4_cidr(),
@@ -585,7 +602,7 @@ impl NetworkInterface {
                     (NlaType::RtaOIF, self.if_idx.to_ne_bytes().to_vec()),
                 ],
             )?,
-            (RtmProtocol::Dhcp, RtScope::Universe) => self.create_rtrequest(
+            (RtmProtocol::Dhcp, RtScope::Universe) => create_rtrequest(
                 NlmsgType::RtmAddRoute,
                 flags,
                 0,
@@ -621,18 +638,12 @@ impl NetworkInterface {
         };
 
         if v.is_empty() {
-            return Err(String::from(format!(
-                "Unable to create request for protocol: {:?} and scope: {:?}",
-                rtm_protocol, rtm_scope
-            )));
+            return Err(format!(
+                "Unable to create request for protocol: {rtm_protocol:?} and scope: {rtm_scope:?}"
+            ));
         }
 
-        checked_sendto(
-            sfd,
-            v.as_ptr() as *const _ as *const c_void,
-            v.len() * SLACK,
-            0,
-        )?;
+        checked_sendto(sfd, v.as_ptr().cast::<c_void>(), v.len() * SLACK, 0)?;
 
         let mut msgbuf = ByteVec::new(8192);
         let mut mhdr = create_nlmsg(&mut sa, &mut msgbuf);
@@ -640,8 +651,8 @@ impl NetworkInterface {
         let mut rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC);
 
         while let Err(e) = rx_bytes {
-            if msgbuf.sz() > 1 * TB {
-                return Err(String::from(format!("Ok.. thats enough: {e}")));
+            if msgbuf.sz() > TB {
+                return Err(format!("Ok.. thats enough: {e}"));
             }
             let new_buf_sz = msgbuf.sz() * 4;
             msgbuf = ByteVec::new(new_buf_sz);
@@ -660,18 +671,18 @@ impl NetworkInterface {
     pub fn del_route(&self, rtm_protocol: RtmProtocol, rtm_scope: RtScope) -> Result<(), String> {
         let sfd = quick_socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)?;
         let mut sa: sockaddr_nl = unsafe { mem::zeroed() };
-        sa.nl_family = AF_NETLINK as u16;
+        sa.nl_family = map_err_str!(u16::try_from(AF_NETLINK))?;
 
         checked_bind(
             sfd,
-            &sa as *const _ as *const sockaddr,
-            mem::size_of::<sockaddr_nl>() as u32,
+            ptr::addr_of!(sa).cast::<sockaddr>(),
+            map_err_str!(u32::try_from(mem::size_of::<sockaddr_nl>()))?,
         )?;
 
         let v = match (rtm_protocol, rtm_scope) {
-            (RtmProtocol::Kernel, RtScope::Link) => self.create_rtrequest(
+            (RtmProtocol::Kernel, RtScope::Link) => create_rtrequest(
                 NlmsgType::RtmDelRoute,
-                (NLM_F_REQUEST | NLM_F_ACK) as u16,
+                map_err_str!(u16::try_from(NLM_F_REQUEST | NLM_F_ACK))?,
                 self.ip4_cidr(),
                 RtnType::Unspecified,
                 rtm_protocol,
@@ -701,9 +712,9 @@ impl NetworkInterface {
                     (NlaType::RtaOIF, self.if_idx.to_ne_bytes().to_vec()),
                 ],
             )?,
-            (RtmProtocol::Dhcp, RtScope::Nowhere) => self.create_rtrequest(
+            (RtmProtocol::Dhcp, RtScope::Nowhere) => create_rtrequest(
                 NlmsgType::RtmDelRoute,
-                (NLM_F_REQUEST | NLM_F_ACK) as u16,
+                map_err_str!(u16::try_from(NLM_F_REQUEST | NLM_F_ACK))?,
                 0,
                 RtnType::Unspecified,
                 rtm_protocol,
@@ -737,18 +748,12 @@ impl NetworkInterface {
         };
 
         if v.is_empty() {
-            return Err(String::from(format!(
-                "Unable to create request for protocol: {:?} and scope: {:?}",
-                rtm_protocol, rtm_scope
-            )));
+            return Err(format!(
+                "Unable to create request for protocol: {rtm_protocol:?} and scope: {rtm_scope:?}",
+            ));
         }
 
-        checked_sendto(
-            sfd,
-            v.as_ptr() as *const _ as *const c_void,
-            v.len() * SLACK,
-            0,
-        )?;
+        checked_sendto(sfd, v.as_ptr().cast::<c_void>(), v.len() * SLACK, 0)?;
 
         let mut msgbuf = ByteBuffer::<BUF_SZ>::new();
         let mut mhdr = create_nlmsg(&mut sa, &mut msgbuf);
@@ -762,83 +767,20 @@ impl NetworkInterface {
         rust_close(sfd)
     }
 
-    fn create_rtrequest(
-        &self,
-        nlmsg_type: NlmsgType,
-        nlmsg_flags: u16,
-        rtm_dst_len: u8,
-        rtm_type: RtnType,
-        rtm_protocol: RtmProtocol,
-        rtm_scope: RtScope,
-        nla_data: Vec<(NlaType, Vec<u8>)>,
-    ) -> Result<Vec<u8>, String> {
-        let rt = rtmsg {
-            rtm_family: AF_INET as u8,
-            rtm_dst_len: rtm_dst_len,
-            rtm_src_len: 0,
-            rtm_tos: 0,
-            rtm_table: RT_TABLE_MAIN,
-
-            /*rtm_protocol: RTPROT_KERNEL,
-            rtm_scope: RT_SCOPE_LINK,*/
-            rtm_protocol: rtm_protocol as u8,
-            rtm_scope: rtm_scope as u8,
-            rtm_type: rtm_type as u8,
-
-            rtm_flags: 0,
-        };
-
-        let mut nlas = create_nlattrs(nla_data)?;
-
-        let msg_buf_len: usize =
-            (rust_nlmsg_align((NLMSG_HDR_SZ + RTMMSG_SZ) as u32) as usize) + nlas.len();
-
-        let nh = nlmsghdr {
-            nlmsg_len: msg_buf_len as u32,
-            nlmsg_type: nlmsg_type as u16,
-            nlmsg_flags: nlmsg_flags,
-            nlmsg_seq: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(errstring)?
-                .as_secs() as u32,
-            nlmsg_pid: 0,
-        };
-
-        let mut fhv = Vec::new();
-        if !rust_is_nlmsg_aligned(RTMMSG_SZ as u32) {
-            let total_family_header_len =
-                rust_nlmsg_align((NLMSG_HDR_SZ + RTMMSG_SZ) as u32) as usize;
-
-            fhv.append(&mut nh.pack().map_err(errstring)?.to_vec());
-            fhv.append(&mut rt.pack().map_err(errstring)?.to_vec());
-            let num_pad_bytes = total_family_header_len - fhv.len();
-            fhv.append(&mut vec![0; num_pad_bytes]);
-        } else {
-            fhv.append(&mut nh.pack().map_err(errstring)?.to_vec());
-            fhv.append(&mut rt.pack().map_err(errstring)?.to_vec());
-        }
-
-        let mut v = Vec::new();
-        v.append(&mut fhv);
-        v.append(&mut nlas);
-
-        Ok(v)
-    }
-
     pub fn show_routes(&self) -> Result<(), String> {
         let sfd = quick_socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)?;
         let mut sa: sockaddr_nl = unsafe { mem::zeroed() };
-        sa.nl_family = AF_NETLINK as u16;
+        sa.nl_family = map_err_str!(u16::try_from(AF_NETLINK))?;
 
         checked_bind(
             sfd,
-            &sa as *const _ as *const sockaddr,
-            mem::size_of::<sockaddr_nl>() as u32,
+            ptr::addr_of!(sa).cast::<sockaddr>(),
+            map_err_str!(u32::try_from(mem::size_of::<sockaddr_nl>()))?,
         )?;
 
-        let v = self.create_rtrequest(
+        let v = create_rtrequest(
             NlmsgType::RtmGetRoute,
-            (NLM_F_REQUEST | NLM_F_DUMP) as u16,
+            map_err_str!(u16::try_from(NLM_F_REQUEST | NLM_F_DUMP))?,
             0,
             RtnType::Unspecified,
             RtmProtocol::Unspecified,
@@ -846,12 +788,7 @@ impl NetworkInterface {
             vec![(NlaType::RtaTable, vec![RT_TABLE_MAIN])],
         )?;
 
-        checked_sendto(
-            sfd,
-            v.as_ptr() as *const _ as *const c_void,
-            v.len() * SLACK,
-            0,
-        )?;
+        checked_sendto(sfd, v.as_ptr().cast::<c_void>(), v.len() * SLACK, 0)?;
 
         let mut msgbuf = ByteVec::new(BUF_SZ);
         let mut mhdr = create_nlmsg(&mut sa, &mut msgbuf);
@@ -862,11 +799,10 @@ impl NetworkInterface {
             match e {
                 RecvErr::OsErr(s) => return Err(s),
                 RecvErr::MsgTrunc => {
-                    if msgbuf.sz() > 1 * TB {
-                        return Err(String::from(format!("Ok.. thats enough: {e}")));
+                    if msgbuf.sz() > TB {
+                        return Err(format!("Ok.. thats enough: {e}"));
                     }
-                    let new_buf_sz = msgbuf.sz() * 4;
-                    msgbuf = ByteVec::new(new_buf_sz);
+                    msgbuf.realloc(4);
                     mhdr = create_nlmsg(&mut sa, &mut msgbuf);
 
                     rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC);
@@ -877,7 +813,7 @@ impl NetworkInterface {
         let mut i = 0;
         while msgbuf.idx() < rx_bytes.clone().ok().unwrap() {
             let rt = parse_msg::<NlaPolicy, ByteVec>(&mut msgbuf, None)?;
-            println!("Route {i}: {:?}", rt);
+            println!("Route {i}: {rt:?}");
             i += 1;
         }
 

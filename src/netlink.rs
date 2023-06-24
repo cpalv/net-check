@@ -1,13 +1,16 @@
 use std::ffi::c_void;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{mem, ptr, vec};
 
 use nix::libc::{
-    iovec, msghdr, sockaddr_nl, NLMSG_ERROR, RTA_DST, RTA_GATEWAY, RTA_OIF, RTA_PREFSRC,
-    RTA_PRIORITY, RTA_TABLE, RTM_DELROUTE, RTM_GETROUTE, RTM_NEWROUTE, RTN_UNICAST, RTN_UNSPEC,
-    RTPROT_KERNEL, RTPROT_UNSPEC, RT_SCOPE_LINK, RT_SCOPE_NOWHERE, RT_SCOPE_UNIVERSE,
+    iovec, msghdr, sockaddr_nl, AF_INET, NLMSG_DONE, NLMSG_ERROR, RTA_DST, RTA_GATEWAY, RTA_OIF,
+    RTA_PREFSRC, RTA_PRIORITY, RTA_TABLE, RTM_DELROUTE, RTM_GETROUTE, RTM_NEWROUTE, RTN_UNICAST,
+    RTN_UNSPEC, RTPROT_KERNEL, RTPROT_UNSPEC, RT_SCOPE_LINK, RT_SCOPE_NOWHERE, RT_SCOPE_UNIVERSE,
     RT_TABLE_MAIN, RT_TABLE_UNSPEC,
 };
 use packed_struct::{prelude::PackedStruct, PackedStructInfo, PackingError};
+
+use crate::map_err_str;
 
 pub const NLMSG_HDR_SZ: usize = mem::size_of::<nlmsghdr>();
 pub const RTMMSG_SZ: usize = mem::size_of::<rtmsg>();
@@ -30,12 +33,13 @@ macro_rules! write_impl {
         ) -> Result<&mut Self, String> {
             if self.build_idx + added_buf.len() > self.buf.len() {
                 return Err(String::from("Exceeded buffer capacity"));
-            } else {
-                for byte in added_buf {
-                    self.buf[self.build_idx] = byte;
-                    self.build_idx += 1;
-                }
             }
+
+            for byte in added_buf {
+                self.buf[self.build_idx] = byte;
+                self.build_idx += 1;
+            }
+
             Ok(self)
         }
 
@@ -63,7 +67,7 @@ macro_rules! write_impl {
                     self.build_idx
                 )));
             }
-            let ok = Ok((unsafe { self.buf.as_ptr().add(self.current_idx) }) as *const T);
+            let ok = Ok((unsafe { self.buf.as_ptr().add(self.current_idx) }).cast::<T>());
             self.current_idx += bytes;
             ok
         }
@@ -173,10 +177,11 @@ pub enum NlmsgType {
     RtmAddRoute = RTM_NEWROUTE,
     RtmDelRoute = RTM_DELROUTE,
     NlmsgError = NLMSG_ERROR as u16,
+    NlmsgDone = NLMSG_DONE as u16,
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct nlmsghdr {
     pub nlmsg_len: u32,
     pub nlmsg_type: u16,
@@ -210,12 +215,11 @@ impl PackedStruct for nlmsghdr {
     }
 
     fn unpack(src: &Self::ByteArray) -> packed_struct::PackingResult<Self> {
-        let mut tmp = nlmsghdr::default();
+        let mut tmp = Self::default();
 
         let mut bb = ByteBuffer::<NLMSG_HDR_SZ>::new();
 
         bb.build(*src).map_err(fun)?;
-        bb.reset();
 
         tmp.nlmsg_len = u32::from_ne_bytes(bb.take_buf::<U32_SZ>().map_err(fun)?);
 
@@ -231,6 +235,22 @@ impl PackedStruct for nlmsghdr {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct nlmsgerr {
+    pub error: isize,
+    pub msg: nlmsghdr,
+    /*
+     * followed by the message contents unless NETLINK_CAP_ACK was set
+     * or the ACK indicates success (error == 0)
+     * message length is aligned with NLMSG_ALIGN()
+     */
+    /*
+     * followed by TLVs defined in enum nlmsgerr_attrs
+     * if NETLINK_EXT_ACK was set
+     */
+}
+
 #[repr(u8)]
 #[derive(Clone, Copy, Debug)]
 pub enum RtnType {
@@ -241,7 +261,7 @@ pub enum RtnType {
 #[repr(u8)]
 #[derive(Clone, Copy, Debug)]
 pub enum RtmProtocol {
-    Kernel = RTPROT_KERNEL as u8,
+    Kernel = RTPROT_KERNEL,
     Dhcp = 16,
     Unspecified = RTPROT_UNSPEC,
 }
@@ -305,10 +325,10 @@ pub fn create_nlattrs(nla_data: Vec<(NlaType, Vec<u8>)>) -> Result<Vec<u8>, Stri
             nla_type: nla_type as u16,
         }
         .pack()
-        .map_err(|e| String::from(format!("{}: error converting nlattr to bytes", e)))?;
+        .map_err(|e| format!("{e}: error converting nlattr to bytes"))?;
 
         v.append(&mut nla.to_vec());
-        v.append(&mut bytes.to_vec());
+        v.append(&mut bytes.clone());
     }
 
     let nla_pad = (rust_nla_align(v.len() as i32) as usize) - v.len();
@@ -319,11 +339,11 @@ pub fn create_nlattrs(nla_data: Vec<(NlaType, Vec<u8>)>) -> Result<Vec<u8>, Stri
 
 pub fn create_nlmsg<B: Buffer>(sa: &mut sockaddr_nl, msgbuf: &mut B) -> msghdr {
     let mut iov = iovec {
-        iov_base: msgbuf.buf_mut_ptr() as *mut c_void,
+        iov_base: msgbuf.buf_mut_ptr().cast::<c_void>(),
         iov_len: msgbuf.sz(),
     };
 
-    let mhdr = msghdr {
+    msghdr {
         msg_name: sa as *mut _ as *mut c_void,
         msg_namelen: mem::size_of::<sockaddr_nl>() as u32,
         msg_iov: &mut iov,
@@ -331,9 +351,68 @@ pub fn create_nlmsg<B: Buffer>(sa: &mut sockaddr_nl, msgbuf: &mut B) -> msghdr {
         msg_control: ptr::null_mut::<c_void>(),
         msg_controllen: 0,
         msg_flags: 0,
+    }
+}
+
+pub fn create_rtrequest(
+    nlmsg_type: NlmsgType,
+    nlmsg_flags: u16,
+    rtm_dst_len: u8,
+    rtm_type: RtnType,
+    rtm_protocol: RtmProtocol,
+    rtm_scope: RtScope,
+    nla_data: Vec<(NlaType, Vec<u8>)>,
+) -> Result<Vec<u8>, String> {
+    let rt = rtmsg {
+        rtm_family: map_err_str!(u8::try_from(AF_INET))?,
+        rtm_dst_len,
+        rtm_src_len: 0,
+        rtm_tos: 0,
+        rtm_table: RT_TABLE_MAIN,
+
+        /*rtm_protocol: RTPROT_KERNEL,
+        rtm_scope: RT_SCOPE_LINK,*/
+        rtm_protocol: rtm_protocol as u8,
+        rtm_scope: rtm_scope as u8,
+        rtm_type: rtm_type as u8,
+
+        rtm_flags: 0,
     };
 
-    mhdr
+    let mut nlas = create_nlattrs(nla_data)?;
+
+    let msg_buf_len: usize =
+        (rust_nlmsg_align((NLMSG_HDR_SZ + RTMMSG_SZ) as u32) as usize) + nlas.len();
+
+    let nh = nlmsghdr {
+        nlmsg_len: map_err_str!(u32::try_from(msg_buf_len))?,
+        nlmsg_type: nlmsg_type as u16,
+        nlmsg_flags,
+        nlmsg_seq: map_err_str!(u32::try_from(
+            map_err_str!(SystemTime::now().duration_since(UNIX_EPOCH))?.as_secs()
+        ))?,
+        nlmsg_pid: 0,
+    };
+
+    let mut fhv = Vec::new();
+    if rust_is_nlmsg_aligned(map_err_str!(u32::try_from(RTMMSG_SZ))?) {
+        fhv.append(&mut map_err_str!(&mut nh.pack())?.to_vec());
+        fhv.append(&mut map_err_str!(&mut rt.pack())?.to_vec());
+    } else {
+        let total_family_header_len =
+            rust_nlmsg_align(map_err_str!(u32::try_from(NLMSG_HDR_SZ + RTMMSG_SZ))?) as usize;
+
+        fhv.append(&mut map_err_str!(&mut nh.pack())?.to_vec());
+        fhv.append(&mut map_err_str!(&mut nh.pack())?.to_vec());
+        let num_pad_bytes = total_family_header_len - fhv.len();
+        fhv.append(&mut vec![0; num_pad_bytes]);
+    }
+
+    let mut v = Vec::new();
+    v.append(&mut fhv);
+    v.append(&mut nlas);
+
+    Ok(v)
 }
 
 pub trait Buffer {
@@ -371,7 +450,7 @@ pub struct ByteBuffer<const TOTAL_SZ: usize> {
 }
 
 impl<const TOTAL_SZ: usize> ByteBuffer<TOTAL_SZ> {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             current_idx: 0,
             build_idx: 0,
@@ -396,6 +475,12 @@ impl ByteVec {
             build_idx: 0,
             buf: vec![0; len],
         }
+    }
+
+    pub fn realloc(&mut self, mul: usize) -> &mut Self {
+        let start_len = self.buf.len();
+        self.buf.resize(start_len * mul, 0);
+        self
     }
 }
 
