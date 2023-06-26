@@ -1,6 +1,6 @@
+mod buffer;
 mod netlink;
 mod nic;
-//use crate::nic;
 
 fn main() {
     let netifs = nic::get_nics();
@@ -13,6 +13,7 @@ fn main() {
         if let Err(e) = netif.show_routes() {
             eprintln!("{e}");
         }
+
         println!();
         /*if netif.name == "enp6s0" {
             println!("restarting {}", netif.name);

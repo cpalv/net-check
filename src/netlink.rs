@@ -1,150 +1,43 @@
+use core::fmt;
+
 use std::ffi::c_void;
+use std::io;
+use std::io::Error;
+use std::net::Ipv4Addr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{mem, ptr, vec};
 
+use nix::libc::{self, RTM_SETLINK};
+
 use nix::libc::{
-    iovec, msghdr, sockaddr_nl, AF_INET, NLMSG_DONE, NLMSG_ERROR, RTA_DST, RTA_GATEWAY, RTA_OIF,
-    RTA_PREFSRC, RTA_PRIORITY, RTA_TABLE, RTM_DELROUTE, RTM_GETROUTE, RTM_NEWROUTE, RTN_UNICAST,
-    RTN_UNSPEC, RTPROT_KERNEL, RTPROT_UNSPEC, RT_SCOPE_LINK, RT_SCOPE_NOWHERE, RT_SCOPE_UNIVERSE,
-    RT_TABLE_MAIN, RT_TABLE_UNSPEC,
+    iovec, msghdr, sockaddr_nl, AF_INET, AF_NETLINK, AF_UNSPEC, ARPHRD_NETROM, IFLA_EXT_MASK,
+    IFLA_IFNAME, NETLINK_ROUTE, NLMSG_DONE, NLMSG_ERROR, RTA_DST, RTA_GATEWAY, RTA_OIF,
+    RTA_PREFSRC, RTA_PRIORITY, RTA_TABLE, RTM_DELROUTE, RTM_GETLINK, RTM_GETROUTE, RTM_NEWROUTE,
+    RTN_UNICAST, RTN_UNSPEC, RTPROT_KERNEL, RTPROT_UNSPEC, RT_SCOPE_LINK, RT_SCOPE_NOWHERE,
+    RT_SCOPE_UNIVERSE, RT_TABLE_MAIN, RT_TABLE_UNSPEC, SOCK_CLOEXEC, SOCK_RAW,
 };
 use packed_struct::{prelude::PackedStruct, PackedStructInfo, PackingError};
 
 use crate::map_err_str;
 
+use crate::buffer::{transmute_vec, Buffer, ByteBuffer};
+
 pub const NLMSG_HDR_SZ: usize = mem::size_of::<nlmsghdr>();
+pub const NLGMSG_ERR_SZ: usize = mem::size_of::<nlmsgerr>();
 pub const RTMMSG_SZ: usize = mem::size_of::<rtmsg>();
+pub const IFINFO_SZ: usize = mem::size_of::<ifinfomsg>();
 pub const NLA_SZ: usize = mem::size_of::<nlattr>();
+pub const ISIZE_SZ: usize = mem::size_of::<isize>();
+pub const USIZE_SZ: usize = mem::size_of::<usize>();
 pub const U32_SZ: usize = mem::size_of::<u32>();
 pub const U16_SZ: usize = mem::size_of::<u16>();
+pub const U8_SZ: usize = mem::size_of::<u8>();
 
 #[macro_export]
 macro_rules! trust_fall {
     ($e:expr) => {
         unsafe { $e }
     };
-}
-
-macro_rules! write_impl {
-    () => {
-        fn build<const BUF_LEN: usize>(
-            &mut self,
-            added_buf: [u8; BUF_LEN],
-        ) -> Result<&mut Self, String> {
-            if self.build_idx + added_buf.len() > self.buf.len() {
-                return Err(String::from("Exceeded buffer capacity"));
-            }
-
-            for byte in added_buf {
-                self.buf[self.build_idx] = byte;
-                self.build_idx += 1;
-            }
-
-            Ok(self)
-        }
-
-        fn buf_mut_ptr(&mut self) -> *mut u8 {
-            self.buf.as_mut_ptr()
-        }
-
-        fn idx(&self) -> usize {
-            self.current_idx
-        }
-
-        fn incr(&mut self, num_bytes: usize) {
-            self.current_idx += num_bytes
-        }
-
-        fn ptr(&self) -> *const u8 {
-            self.buf.as_ptr()
-        }
-
-        fn ptr_cast<T>(&mut self) -> Result<*const T, String> {
-            let bytes = mem::size_of::<T>();
-            if self.current_idx + bytes > self.build_idx {
-                return Err(String::from(format!(
-                    "No data beyond idx {} to cast",
-                    self.build_idx
-                )));
-            }
-            let ok = Ok((unsafe { self.buf.as_ptr().add(self.current_idx) }).cast::<T>());
-            self.current_idx += bytes;
-            ok
-        }
-
-        fn reset(&mut self) -> &mut Self {
-            self.current_idx = 0;
-            self
-        }
-
-        fn sz(&self) -> usize {
-            self.buf.len()
-        }
-
-        fn transmute_to<T: Copy>(&mut self) -> Result<Box<T>, String> {
-            let pt = self.ptr_cast::<T>()?;
-
-            Ok(Box::<T>::new(unsafe { *pt }))
-        }
-
-        fn take_buf<const NUM_BYTES: usize>(&mut self) -> Result<[u8; NUM_BYTES], String> {
-            let end_idx = self.current_idx + NUM_BYTES;
-            if end_idx > self.buf.len() {
-                return Err(String::from("End index exceeds buffer"));
-            }
-
-            let mut scratch: [u8; NUM_BYTES] = [0; NUM_BYTES];
-
-            for (i, byte) in self.buf[self.current_idx..end_idx].iter().enumerate() {
-                scratch[i] = *byte;
-            }
-
-            self.current_idx += NUM_BYTES;
-            Ok(scratch)
-        }
-
-        fn take_vec(&mut self, num_bytes: usize) -> Result<Vec<u8>, String> {
-            let end_idx = self.current_idx + num_bytes;
-            if end_idx > self.buf.len() {
-                return Err(String::from("End index exceeds buffer"));
-            }
-
-            let mut scratch = Vec::new();
-
-            for byte in self.buf[self.current_idx..end_idx].iter() {
-                scratch.push(*byte);
-            }
-
-            self.current_idx += num_bytes;
-            Ok(scratch)
-        }
-    };
-}
-
-macro_rules! impl_buff {
-    ($buf_sz:ident $struct_name:ident) => {
-        impl<const $buf_sz: usize> Buffer for $struct_name<$buf_sz> {
-            write_impl!();
-        }
-    };
-    ($struct_name:ident) => {
-        impl Buffer for $struct_name {
-            write_impl!();
-        }
-    };
-}
-
-pub fn transmute_vec<const NUM_BYTES: usize>(v: Vec<u8>) -> Result<[u8; NUM_BYTES], String> {
-    let mut scratch = [0; NUM_BYTES];
-    match v.len() {
-        U16_SZ | U32_SZ | NLMSG_HDR_SZ | RTMMSG_SZ => {
-            for (i, byte) in v.iter().enumerate() {
-                scratch[i] = *byte;
-            }
-            Ok(scratch)
-        }
-        _ => Err(String::from("Cannot transmute byte vector to byte array")),
-    }
 }
 
 // HACKS: vars/functions redefined here to make the compiler happy
@@ -170,9 +63,51 @@ fn fun<O: ToString>(_op: O) -> PackingError {
     PackingError::InternalError
 }
 
+fn quick_socket(domain: i32, sock_type: i32, protocol: i32) -> io::Result<i32> {
+    let sfd = unsafe { libc::socket(domain, sock_type, protocol) };
+    if sfd < 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(sfd)
+}
+
+fn rust_close(sfd: i32) -> io::Result<()> {
+    if unsafe { libc::close(sfd) } < 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct NetlinkSocket {
+    sfd: i32,
+}
+
+impl Drop for NetlinkSocket {
+    fn drop(&mut self) {
+        if let Err(e) = rust_close(self.sfd) {
+            eprintln!("error dropping {self:?}: {e}");
+            return;
+        }
+    }
+}
+
+impl NetlinkSocket {
+    pub fn new() -> io::Result<Self> {
+        let sfd = match quick_socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE) {
+            Ok(socket_file_descriptor) => socket_file_descriptor,
+            Err(e) => return Err(e),
+        };
+
+        Ok(Self { sfd: sfd })
+    }
+}
+
 #[repr(u16)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NlmsgType {
+    RtmGetLink = RTM_GETLINK,
+    RtmSetLink = RTM_SETLINK,
     RtmGetRoute = RTM_GETROUTE,
     RtmAddRoute = RTM_NEWROUTE,
     RtmDelRoute = RTM_DELROUTE,
@@ -221,22 +156,22 @@ impl PackedStruct for nlmsghdr {
 
         bb.build(*src).map_err(fun)?;
 
-        tmp.nlmsg_len = u32::from_ne_bytes(bb.take_buf::<U32_SZ>().map_err(fun)?);
+        tmp.nlmsg_len = u32::from_ne_bytes(bb.gib_buf::<U32_SZ>().map_err(fun)?);
 
-        tmp.nlmsg_type = u16::from_ne_bytes(bb.take_buf::<U16_SZ>().map_err(fun)?);
+        tmp.nlmsg_type = u16::from_ne_bytes(bb.gib_buf::<U16_SZ>().map_err(fun)?);
 
-        tmp.nlmsg_flags = u16::from_ne_bytes(bb.take_buf::<U16_SZ>().map_err(fun)?);
+        tmp.nlmsg_flags = u16::from_ne_bytes(bb.gib_buf::<U16_SZ>().map_err(fun)?);
 
-        tmp.nlmsg_seq = u32::from_ne_bytes(bb.take_buf::<U32_SZ>().map_err(fun)?);
+        tmp.nlmsg_seq = u32::from_ne_bytes(bb.gib_buf::<U32_SZ>().map_err(fun)?);
 
-        tmp.nlmsg_pid = u32::from_ne_bytes(bb.take_buf::<U32_SZ>().map_err(fun)?);
+        tmp.nlmsg_pid = u32::from_ne_bytes(bb.gib_buf::<U32_SZ>().map_err(fun)?);
 
         Ok(tmp)
     }
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct nlmsgerr {
     pub error: isize,
     pub msg: nlmsghdr,
@@ -249,6 +184,39 @@ pub struct nlmsgerr {
      * followed by TLVs defined in enum nlmsgerr_attrs
      * if NETLINK_EXT_ACK was set
      */
+}
+
+impl PackedStructInfo for nlmsgerr {
+    fn packed_bits() -> usize {
+        (mem::size_of::<isize>() + NLMSG_HDR_SZ) * 8
+    }
+}
+
+impl PackedStruct for nlmsgerr {
+    type ByteArray = [u8; NLGMSG_ERR_SZ];
+    fn pack(&self) -> packed_struct::PackingResult<Self::ByteArray> {
+        let mut bb = ByteBuffer::<NLGMSG_ERR_SZ>::new();
+        bb.build(self.error.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.msg.pack()?)
+            .map_err(fun)?;
+
+        Ok(bb.buf)
+    }
+
+    fn unpack(src: &Self::ByteArray) -> packed_struct::PackingResult<Self> {
+        let mut tmp = Self::default();
+
+        let mut bb = ByteBuffer::<NLGMSG_ERR_SZ>::new();
+
+        bb.build(*src).map_err(fun)?;
+
+        tmp.error = isize::from_ne_bytes(bb.gib_buf::<ISIZE_SZ>().map_err(fun)?);
+
+        tmp.msg = nlmsghdr::unpack(&bb.gib_buf::<NLMSG_HDR_SZ>().map_err(fun)?)?;
+
+        Ok(tmp)
+    }
 }
 
 #[repr(u8)]
@@ -305,10 +273,232 @@ pub enum NlaType {
     RtaDestination = RTA_DST,
     RtaPrefSource = RTA_PREFSRC,
     RtaOIF = RTA_OIF,
+    IflaExtMask = IFLA_EXT_MASK,
+    IflaIfname = IFLA_IFNAME,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NlaPolicyError {
+    Invalid,
+}
+
+impl fmt::Display for NlaPolicyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid => write!(f, "NLA is invalid"),
+        }
+    }
+}
+
+pub trait NlaPolicyValidator {
+    fn validate(&self, nla: &nlattr) -> Result<(), NlaPolicyError>;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct NlaPolicy {
+    max_len: usize,
+}
+
+impl NlaPolicyValidator for NlaPolicy {
+    fn validate(&self, nla: &nlattr) -> Result<(), NlaPolicyError> {
+        if (nla.nla_len as usize) > self.max_len {
+            return Err(NlaPolicyError::Invalid);
+        }
+        Ok(())
+    }
+}
+
+/*****************************************************************
+ *		Link layer specific messages.
+ ****/
+
+/* struct ifinfomsg
+ * passes link level specific information, not dependent
+ * on network protocol.
+ */
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub struct ifinfomsg {
+    pub ifi_family: u8,
+    pub __ifi_pad: u8,
+    pub ifi_type: u16,   /* ARPHRD_* */
+    pub ifi_index: u32,  /* Link index	*/
+    pub ifi_flags: i16,  /* IFF_* flags	*/
+    pub ifi_change: i16, /* IFF_* change mask */
+    pub __ifi_pad2: u32, // 4 bytes of pad
+}
+
+impl PackedStructInfo for ifinfomsg {
+    fn packed_bits() -> usize {
+        IFINFO_SZ * 8
+    }
+}
+
+impl PackedStruct for ifinfomsg {
+    type ByteArray = [u8; IFINFO_SZ];
+    fn pack(&self) -> packed_struct::PackingResult<Self::ByteArray> {
+        let mut bb = ByteBuffer::<IFINFO_SZ>::new();
+        bb.build(self.ifi_family.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.__ifi_pad.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.ifi_type.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.ifi_index.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.ifi_flags.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.ifi_change.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.__ifi_pad2.to_ne_bytes())
+            .map_err(fun)?;
+
+        Ok(bb.buf)
+    }
+
+    fn unpack(src: &Self::ByteArray) -> packed_struct::PackingResult<Self> {
+        let mut tmp = Self::default();
+
+        let mut bb = ByteBuffer::<NLMSG_HDR_SZ>::new();
+
+        bb.build(*src).map_err(fun)?;
+
+        tmp.ifi_family = bb.gib_checked::<u8>().map_err(fun)?;
+
+        tmp.__ifi_pad = bb.gib_checked::<u8>().map_err(fun)?;
+
+        tmp.ifi_type = bb.gib_checked::<u16>().map_err(fun)?;
+
+        tmp.ifi_index = bb.gib_checked::<u32>().map_err(fun)?;
+
+        tmp.ifi_flags = bb.gib_checked::<i16>().map_err(fun)?;
+
+        tmp.ifi_change = bb.gib_checked::<i16>().map_err(fun)?;
+
+        tmp.__ifi_pad2 = bb.gib_checked::<u32>().map_err(fun)?;
+
+        Ok(tmp)
+    }
+}
+
+#[derive(Debug)]
+pub struct Route {
+    pub table: u8,
+    pub protocol: u8,
+    pub scope: u8,
+    pub rt_priority: u8,
+    pub rta_dst: Ipv4Addr,
+    pub rta_gwy: Ipv4Addr,
+    pub rta_oif: u32,
+}
+
+impl Default for Route {
+    fn default() -> Self {
+        Self {
+            table: 0,
+            protocol: 0,
+            scope: 0,
+            rt_priority: 0,
+            rta_dst: Ipv4Addr::new(0, 0, 0, 0),
+            rta_gwy: Ipv4Addr::new(0, 0, 0, 0),
+            rta_oif: 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct NlAtterData {
+    nla: nlattr,
+    data: Vec<u8>,
+}
+
+pub fn parse_nlas<F: Sized + NlaPolicyValidator, B: Buffer>(
+    remaining_msg_bytes: &mut i64,
+    msgbuf: &mut B,
+    nlavp: Option<&F>,
+) -> Result<Vec<NlAtterData>, String> {
+    let mut v = Vec::new();
+    while *remaining_msg_bytes > 0 {
+        let nla = map_err_str!(nlattr::unpack(&msgbuf.gib_buf::<NLA_SZ>()?))?;
+
+        if nlavp.is_some() {
+            map_err_str!(nlavp.unwrap().validate(&nla))?;
+        }
+
+        let nla_payload_bytes = (nla.nla_len - NLA_SZ as u16) as usize;
+
+        let nlad = NlAtterData {
+            nla: nla,
+            data: msgbuf.gib_vec(nla_payload_bytes)?,
+        };
+
+        let aligned_payload = rust_nla_align(nla_payload_bytes as i32);
+
+        msgbuf.incr((aligned_payload as usize) - nla_payload_bytes);
+
+        v.push(nlad);
+
+        *remaining_msg_bytes -= ((NLA_SZ as i32) + aligned_payload) as i64;
+    }
+
+    Ok(v)
+}
+
+// https://man7.org/linux/man-pages/man7/netlink.7.html#EXAMPLES
+pub fn parse_msg<F: Sized + NlaPolicyValidator, B: Buffer>(
+    msgbuf: &mut B,
+    nlavp: Option<&F>,
+) -> Result<Route, String> {
+    let nlhr = map_err_str!(nlmsghdr::unpack(&msgbuf.gib_buf::<NLMSG_HDR_SZ>()?))?;
+
+    if nlhr.nlmsg_type == NlmsgType::NlmsgError as u16 {
+        let nle = map_err_str!(nlmsgerr::unpack(&msgbuf.gib_buf::<NLGMSG_ERR_SZ>()?))?;
+        return Err(format!("net link message error: {nle:?}"));
+    }
+    let rtm = map_err_str!(rtmsg::unpack(&msgbuf.gib_buf::<RTMMSG_SZ>()?))?;
+
+    // parse remaining nlattr structs
+    let msg_bytes = nlhr.nlmsg_len as i64;
+    let mut remaining_msg_bytes = msg_bytes - ((NLMSG_HDR_SZ + RTMMSG_SZ) as i64);
+
+    let mut rt = Route {
+        scope: rtm.rtm_scope,
+        table: rtm.rtm_table,
+        protocol: rtm.rtm_protocol,
+        ..Default::default()
+    };
+
+    let nlas = parse_nlas(&mut remaining_msg_bytes, msgbuf, nlavp)?;
+
+    for nla in nlas {
+        match nla.nla.nla_type {
+            RTA_TABLE => {
+                rt.table = *nla.data.first().unwrap();
+            }
+            RTA_PRIORITY => {
+                rt.rt_priority = *nla.data.first().unwrap();
+            }
+            RTA_GATEWAY => {
+                let octets = transmute_vec::<U32_SZ>(&nla.data)?;
+                rt.rta_gwy = Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]);
+            }
+            RTA_DST => {
+                let octets = transmute_vec::<U32_SZ>(&nla.data)?;
+                rt.rta_dst = Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]);
+            }
+            RTA_OIF => {
+                rt.rta_oif = u32::from_ne_bytes(transmute_vec::<U32_SZ>(&nla.data)?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(rt)
 }
 
 #[repr(C)]
-#[derive(Debug, PackedStruct)]
+#[derive(Clone, Copy, Debug, PackedStruct)]
 #[packed_struct(endian = "lsb")]
 pub struct nlattr {
     pub nla_len: u16,
@@ -320,15 +510,22 @@ pub struct nlattr {
 pub fn create_nlattrs(nla_data: Vec<(NlaType, Vec<u8>)>) -> Result<Vec<u8>, String> {
     let mut v = Vec::new();
     for (nla_type, bytes) in nla_data {
-        let nla = nlattr {
-            nla_len: (NLA_SZ + bytes.len()) as u16,
-            nla_type: nla_type as u16,
-        }
-        .pack()
-        .map_err(|e| format!("{e}: error converting nlattr to bytes"))?;
+        let nla_total_len = rust_nla_align((NLA_SZ + bytes.len()) as i32) as usize;
+        let nla_pad = nla_total_len - (NLA_SZ + bytes.len());
 
-        v.append(&mut nla.to_vec());
+        let nla = nlattr {
+            nla_len: nla_total_len as u16,
+            nla_type: nla_type as u16,
+        };
+
+        v.append(
+            &mut nla
+                .pack()
+                .map_err(|e| format!("{e}: error converting nlattr to bytes"))?
+                .to_vec(),
+        );
         v.append(&mut bytes.clone());
+        v.append(&mut vec![0; nla_pad]);
     }
 
     let nla_pad = (rust_nla_align(v.len() as i32) as usize) - v.len();
@@ -352,6 +549,61 @@ pub fn create_nlmsg<B: Buffer>(sa: &mut sockaddr_nl, msgbuf: &mut B) -> msghdr {
         msg_controllen: 0,
         msg_flags: 0,
     }
+}
+
+pub fn create_ifirequest(
+    nlmsg_type: NlmsgType,
+    nlmsg_flags: u16,
+    if_type: u16,
+    if_idx: u32,
+    if_flags: i16,
+    if_change: i16,
+    nla_data: Vec<(NlaType, Vec<u8>)>,
+) -> Result<Vec<u8>, String> {
+    let ifm = ifinfomsg {
+        ifi_family: AF_UNSPEC as u8,
+        __ifi_pad: 0,
+        ifi_type: if_type,
+        ifi_index: if_idx,
+        ifi_flags: if_flags,
+        ifi_change: if_change,
+        __ifi_pad2: 0,
+    };
+
+    let mut nlas = create_nlattrs(nla_data)?;
+
+    let msg_buf_len: usize =
+        (rust_nlmsg_align((NLMSG_HDR_SZ + IFINFO_SZ) as u32) as usize) + nlas.len();
+
+    let nh = nlmsghdr {
+        nlmsg_len: map_err_str!(u32::try_from(msg_buf_len))?,
+        nlmsg_type: nlmsg_type as u16,
+        nlmsg_flags,
+        nlmsg_seq: map_err_str!(u32::try_from(
+            map_err_str!(SystemTime::now().duration_since(UNIX_EPOCH))?.as_secs()
+        ))?,
+        nlmsg_pid: 0,
+    };
+
+    let mut fhv = Vec::new();
+    if rust_is_nlmsg_aligned(map_err_str!(u32::try_from(IFINFO_SZ))?) {
+        fhv.append(&mut map_err_str!(&mut nh.pack())?.to_vec());
+        fhv.append(&mut map_err_str!(&mut ifm.pack())?.to_vec());
+    } else {
+        let total_family_header_len =
+            rust_nlmsg_align(map_err_str!(u32::try_from(NLMSG_HDR_SZ + IFINFO_SZ))?) as usize;
+
+        fhv.append(&mut map_err_str!(&mut nh.pack())?.to_vec());
+        fhv.append(&mut map_err_str!(&mut ifm.pack())?.to_vec());
+        let num_pad_bytes = total_family_header_len - fhv.len();
+        fhv.append(&mut vec![0; num_pad_bytes]);
+    }
+
+    let mut v = Vec::new();
+    v.append(&mut fhv);
+    v.append(&mut nlas);
+
+    Ok(v)
 }
 
 pub fn create_rtrequest(
@@ -403,7 +655,7 @@ pub fn create_rtrequest(
             rust_nlmsg_align(map_err_str!(u32::try_from(NLMSG_HDR_SZ + RTMMSG_SZ))?) as usize;
 
         fhv.append(&mut map_err_str!(&mut nh.pack())?.to_vec());
-        fhv.append(&mut map_err_str!(&mut nh.pack())?.to_vec());
+        fhv.append(&mut map_err_str!(&mut rt.pack())?.to_vec());
         let num_pad_bytes = total_family_header_len - fhv.len();
         fhv.append(&mut vec![0; num_pad_bytes]);
     }
@@ -413,330 +665,4 @@ pub fn create_rtrequest(
     v.append(&mut nlas);
 
     Ok(v)
-}
-
-pub trait Buffer {
-    fn build<const BUF_LEN: usize>(
-        &mut self,
-        added_buf: [u8; BUF_LEN],
-    ) -> Result<&mut Self, String>;
-
-    fn buf_mut_ptr(&mut self) -> *mut u8;
-
-    fn idx(&self) -> usize;
-
-    fn incr(&mut self, num_bytes: usize);
-
-    fn ptr(&self) -> *const u8;
-
-    fn ptr_cast<T>(&mut self) -> Result<*const T, String>;
-
-    fn transmute_to<T: Copy>(&mut self) -> Result<Box<T>, String>;
-
-    fn reset(&mut self) -> &mut Self;
-
-    fn sz(&self) -> usize;
-
-    fn take_buf<const NUM_BYTES: usize>(&mut self) -> Result<[u8; NUM_BYTES], String>;
-
-    fn take_vec(&mut self, num_bytes: usize) -> Result<Vec<u8>, String>;
-}
-
-#[derive(Debug)]
-pub struct ByteBuffer<const TOTAL_SZ: usize> {
-    current_idx: usize,
-    build_idx: usize,
-    buf: [u8; TOTAL_SZ],
-}
-
-impl<const TOTAL_SZ: usize> ByteBuffer<TOTAL_SZ> {
-    pub const fn new() -> Self {
-        Self {
-            current_idx: 0,
-            build_idx: 0,
-            buf: [0; TOTAL_SZ],
-        }
-    }
-}
-
-impl_buff!(TOTAL_SZ ByteBuffer);
-
-#[derive(Debug)]
-pub struct ByteVec {
-    current_idx: usize,
-    build_idx: usize,
-    buf: Vec<u8>,
-}
-
-impl ByteVec {
-    pub fn new(len: usize) -> Self {
-        Self {
-            current_idx: 0,
-            build_idx: 0,
-            buf: vec![0; len],
-        }
-    }
-
-    pub fn realloc(&mut self, mul: usize) -> &mut Self {
-        let start_len = self.buf.len();
-        self.buf.resize(start_len * mul, 0);
-        self
-    }
-}
-
-impl_buff!(ByteVec);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[derive(Debug, Default, PackedStruct)]
-    #[packed_struct(endian = "lsb")]
-    pub struct ReferenceImpl {
-        pub nlmsg_len: u32,
-        pub nlmsg_type: u16,
-        pub nlmsg_flags: u16,
-        pub nlmsg_seq: u32,
-        pub nlmsg_pid: u32,
-    }
-
-    #[repr(C)]
-    #[derive(Copy, Clone, Debug, Default, PartialEq)]
-    pub struct msgvec {
-        pub nlmsg_len: u32,
-        pub nlmsg_type: u16,
-        pub nlmsg_flags: u16,
-        pub nlmsg_seq: u32,
-        pub nlmsg_pid: u32,
-    }
-
-    impl PackedStructInfo for msgvec {
-        fn packed_bits() -> usize {
-            NLMSG_HDR_SZ * 8
-        }
-    }
-
-    impl PackedStruct for msgvec {
-        type ByteArray = [u8; NLMSG_HDR_SZ];
-        fn pack(&self) -> packed_struct::PackingResult<Self::ByteArray> {
-            let mut bb = ByteVec::new(NLMSG_HDR_SZ);
-            bb.build(self.nlmsg_len.to_ne_bytes())
-                .map_err(fun)?
-                .build(self.nlmsg_type.to_ne_bytes())
-                .map_err(fun)?
-                .build(self.nlmsg_flags.to_ne_bytes())
-                .map_err(fun)?
-                .build(self.nlmsg_seq.to_ne_bytes())
-                .map_err(fun)?
-                .build(self.nlmsg_pid.to_ne_bytes())
-                .map_err(fun)?;
-
-            Ok(transmute_vec::<NLMSG_HDR_SZ>(bb.buf).map_err(fun)?)
-        }
-
-        fn unpack(src: &Self::ByteArray) -> packed_struct::PackingResult<Self> {
-            let mut tmp = msgvec::default();
-
-            let mut bb = ByteVec::new(NLMSG_HDR_SZ);
-
-            bb.build(*src).map_err(fun)?;
-
-            tmp.nlmsg_len = u32::from_ne_bytes(bb.take_buf::<U32_SZ>().map_err(fun)?);
-
-            tmp.nlmsg_type = u16::from_ne_bytes(bb.take_buf::<U16_SZ>().map_err(fun)?);
-
-            tmp.nlmsg_flags = u16::from_ne_bytes(bb.take_buf::<U16_SZ>().map_err(fun)?);
-
-            tmp.nlmsg_seq = u32::from_ne_bytes(bb.take_buf::<U32_SZ>().map_err(fun)?);
-
-            tmp.nlmsg_pid = u32::from_ne_bytes(bb.take_buf::<U32_SZ>().map_err(fun)?);
-
-            Ok(tmp)
-        }
-    }
-
-    #[test]
-    fn test_pack_buffer() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as u32;
-
-        let n = nlmsghdr {
-            nlmsg_len: 30,
-            nlmsg_type: 5,
-            nlmsg_flags: 10,
-            nlmsg_seq: now,
-            nlmsg_pid: 0,
-        };
-
-        let r = ReferenceImpl {
-            nlmsg_len: 30,
-            nlmsg_type: 5,
-            nlmsg_flags: 10,
-            nlmsg_seq: now,
-            nlmsg_pid: 0,
-        };
-
-        assert_eq!(n.pack().unwrap(), r.pack().unwrap())
-    }
-
-    #[test]
-    fn test_unpack_buffer() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as u32;
-
-        let n = nlmsghdr {
-            nlmsg_len: 30,
-            nlmsg_type: 5,
-            nlmsg_flags: 10,
-            nlmsg_seq: now,
-            nlmsg_pid: 0,
-        };
-
-        let bytes = n.pack().unwrap();
-
-        assert_eq!(n, nlmsghdr::unpack(&bytes).unwrap())
-    }
-
-    #[test]
-    fn test_pack_vec() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as u32;
-
-        let n = nlmsghdr {
-            nlmsg_len: 30,
-            nlmsg_type: 5,
-            nlmsg_flags: 10,
-            nlmsg_seq: now,
-            nlmsg_pid: 0,
-        };
-
-        let r = ReferenceImpl {
-            nlmsg_len: 30,
-            nlmsg_type: 5,
-            nlmsg_flags: 10,
-            nlmsg_seq: now,
-            nlmsg_pid: 0,
-        };
-
-        assert_eq!(n.pack().unwrap(), r.pack().unwrap())
-    }
-
-    #[test]
-    fn test_unpack_vec() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as u32;
-
-        let n = nlmsghdr {
-            nlmsg_len: 30,
-            nlmsg_type: 5,
-            nlmsg_flags: 10,
-            nlmsg_seq: now,
-            nlmsg_pid: 0,
-        };
-
-        let bytes = n.pack().unwrap();
-
-        assert_eq!(n, nlmsghdr::unpack(&bytes).unwrap())
-    }
-
-    #[test]
-    fn test_ptr_cast_buffer() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as u32;
-
-        let n = nlmsghdr {
-            nlmsg_len: 30,
-            nlmsg_type: 5,
-            nlmsg_flags: 10,
-            nlmsg_seq: now,
-            nlmsg_pid: 0,
-        };
-
-        let mut bb = ByteBuffer::<32>::new();
-        bb.build(n.pack().unwrap()).unwrap();
-
-        let np = bb.ptr_cast::<nlmsghdr>().unwrap();
-
-        assert_eq!(n, unsafe { *np })
-    }
-
-    #[test]
-    fn test_transmute_buffer_to() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as u32;
-
-        let n = nlmsghdr {
-            nlmsg_len: 30,
-            nlmsg_type: 5,
-            nlmsg_flags: 10,
-            nlmsg_seq: now,
-            nlmsg_pid: 0,
-        };
-
-        let mut bb = ByteBuffer::<32>::new();
-        bb.build(n.pack().unwrap()).unwrap();
-
-        let msg = bb.transmute_to::<nlmsghdr>().unwrap();
-
-        assert_eq!(n, *(msg.as_ref()))
-    }
-
-    #[test]
-    fn test_ptr_cast_vec() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as u32;
-
-        let n = nlmsghdr {
-            nlmsg_len: 30,
-            nlmsg_type: 5,
-            nlmsg_flags: 10,
-            nlmsg_seq: now,
-            nlmsg_pid: 0,
-        };
-
-        let mut bb = ByteVec::new(32);
-        bb.build(n.pack().unwrap()).unwrap();
-
-        let np = bb.ptr_cast::<nlmsghdr>().unwrap();
-
-        assert_eq!(n, unsafe { *np })
-    }
-
-    #[test]
-    fn test_transmute_vec_to() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as u32;
-
-        let n = nlmsghdr {
-            nlmsg_len: 30,
-            nlmsg_type: 5,
-            nlmsg_flags: 10,
-            nlmsg_seq: now,
-            nlmsg_pid: 0,
-        };
-
-        let mut bb = ByteVec::new(32);
-        bb.build(n.pack().unwrap()).unwrap();
-
-        let msg = bb.transmute_to::<nlmsghdr>().unwrap();
-
-        assert_eq!(n, *(msg.as_ref()))
-    }
 }
