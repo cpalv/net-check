@@ -37,6 +37,8 @@ macro_rules! write_impl {
             self.buf.as_ptr()
         }
 
+        // Non-strict (relaxed) casting useful for initializing inner buf
+        // via FFI where the implementing struct cannot do book keeping
         fn ptr_cast<T>(&mut self, strict: bool) -> Result<*const T, String> {
             let bytes = mem::size_of::<T>();
             if strict {

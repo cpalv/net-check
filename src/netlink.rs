@@ -1,20 +1,19 @@
 use core::fmt;
 
-use std::ffi::c_void;
+use std::ffi;
 use std::io;
-use std::io::Error;
 use std::net::Ipv4Addr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{mem, ptr, vec};
 
-use nix::libc::{self, RTM_SETLINK};
+use nix::libc;
 
 use nix::libc::{
-    iovec, msghdr, sockaddr_nl, AF_INET, AF_NETLINK, AF_UNSPEC, ARPHRD_NETROM, IFLA_EXT_MASK,
-    IFLA_IFNAME, NETLINK_ROUTE, NLMSG_DONE, NLMSG_ERROR, RTA_DST, RTA_GATEWAY, RTA_OIF,
-    RTA_PREFSRC, RTA_PRIORITY, RTA_TABLE, RTM_DELROUTE, RTM_GETLINK, RTM_GETROUTE, RTM_NEWROUTE,
-    RTN_UNICAST, RTN_UNSPEC, RTPROT_KERNEL, RTPROT_UNSPEC, RT_SCOPE_LINK, RT_SCOPE_NOWHERE,
-    RT_SCOPE_UNIVERSE, RT_TABLE_MAIN, RT_TABLE_UNSPEC, SOCK_CLOEXEC, SOCK_RAW,
+    AF_INET, AF_NETLINK, AF_UNSPEC, ARPHRD_NETROM, IFLA_EXT_MASK, IFLA_IFNAME, NETLINK_ROUTE,
+    NLMSG_DONE, NLMSG_ERROR, RTA_DST, RTA_GATEWAY, RTA_OIF, RTA_PREFSRC, RTA_PRIORITY, RTA_TABLE,
+    RTM_DELROUTE, RTM_GETLINK, RTM_GETROUTE, RTM_NEWROUTE, RTM_SETLINK, RTN_UNICAST, RTN_UNSPEC,
+    RTPROT_KERNEL, RTPROT_UNSPEC, RT_SCOPE_LINK, RT_SCOPE_NOWHERE, RT_SCOPE_UNIVERSE,
+    RT_TABLE_MAIN, RT_TABLE_UNSPEC, SOCK_CLOEXEC, SOCK_RAW,
 };
 use packed_struct::{prelude::PackedStruct, PackedStructInfo, PackingError};
 
@@ -59,34 +58,41 @@ pub const fn rust_is_nlmsg_aligned(len: u32) -> bool {
     (NLMSG_HDR_SZ + (len as usize)) % 4 == 0
 }
 
+const SLACK: usize = 3;
+
 fn fun<O: ToString>(_op: O) -> PackingError {
     PackingError::InternalError
 }
 
-fn quick_socket(domain: i32, sock_type: i32, protocol: i32) -> io::Result<i32> {
-    let sfd = unsafe { libc::socket(domain, sock_type, protocol) };
-    if sfd < 0 {
-        return Err(Error::last_os_error());
-    }
-    Ok(sfd)
+#[derive(Debug, Clone)]
+pub enum RecvErr {
+    OsErr(String),
+    MsgTrunc,
 }
 
-fn rust_close(sfd: i32) -> io::Result<()> {
-    if unsafe { libc::close(sfd) } < 0 {
-        return Err(Error::last_os_error());
+impl fmt::Display for RecvErr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OsErr(s) => write!(f, "{s}"),
+            Self::MsgTrunc => write!(f, "Message truncated"),
+        }
     }
-    Ok(())
 }
 
 #[derive(Debug)]
-struct NetlinkSocket {
-    sfd: i32,
+pub struct NetlinkSocket {
+    descriptor: i32,
+    sa: libc::sockaddr_nl,
 }
 
 impl Drop for NetlinkSocket {
     fn drop(&mut self) {
-        if let Err(e) = rust_close(self.sfd) {
-            eprintln!("error dropping {self:?}: {e}");
+        // SAFETY:
+        // drop (close) may only be called once
+        // see section "Deal with error returns from close"
+        // https://man7.org/linux/man-pages/man2/close.2.html
+        if trust_fall!(libc::close(self.descriptor)) < 0 {
+            eprintln!("error dropping {self:?}: {}", io::Error::last_os_error());
             return;
         }
     }
@@ -94,12 +100,90 @@ impl Drop for NetlinkSocket {
 
 impl NetlinkSocket {
     pub fn new() -> io::Result<Self> {
-        let sfd = match quick_socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE) {
-            Ok(socket_file_descriptor) => socket_file_descriptor,
-            Err(e) => return Err(e),
+        let sfd = trust_fall!(libc::socket(
+            AF_NETLINK,
+            SOCK_RAW | SOCK_CLOEXEC,
+            NETLINK_ROUTE
+        ));
+        if sfd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // SAFETY:
+        // safe since libc::sockaddr_nl contains no pointer fields
+        // and therefore no null ptr dereference can occur
+        //
+        // ```
+        // println!("addr of null: {:p}", std::ptr::null::<usize>());
+        // ```
+        let mut sa: libc::sockaddr_nl = trust_fall!(mem::zeroed());
+        sa.nl_family = AF_NETLINK as u16;
+
+        Ok(Self {
+            descriptor: sfd,
+            sa: sa,
+        })
+    }
+
+    pub fn bind(&self) -> io::Result<&Self> {
+        let rc = trust_fall!(libc::bind(
+            self.descriptor,
+            ptr::addr_of!(self.sa).cast::<libc::sockaddr>(),
+            mem::size_of::<libc::sockaddr_nl>() as u32,
+        ));
+
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(self)
+    }
+
+    pub fn sendto(&self, v: Vec<u8>, flags: i32) -> io::Result<&Self> {
+        let rc = trust_fall!(libc::sendto(
+            self.descriptor,
+            v.as_ptr().cast::<ffi::c_void>(),
+            v.len() * SLACK,
+            flags,
+            ptr::null::<libc::sockaddr>(),
+            0,
+        ));
+
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(self)
+    }
+
+    pub fn recvmsg(&self, msghdr: *mut libc::msghdr, flags: i32) -> Result<usize, RecvErr> {
+        let len = trust_fall!(libc::recvmsg(self.descriptor, msghdr, flags));
+        if len < 0 {
+            return Err(RecvErr::OsErr(io::Error::last_os_error().to_string()));
+        }
+
+        if trust_fall!((*msghdr).msg_flags) == libc::MSG_TRUNC {
+            return Err(RecvErr::MsgTrunc);
+        }
+
+        Ok(len as usize)
+    }
+
+    pub fn create_msg<B: Buffer>(&mut self, msgbuf: &mut B) -> libc::msghdr {
+        let mut iov = libc::iovec {
+            iov_base: msgbuf.buf_mut_ptr().cast::<ffi::c_void>(),
+            iov_len: msgbuf.sz(),
         };
 
-        Ok(Self { sfd: sfd })
+        libc::msghdr {
+            msg_name: ptr::addr_of_mut!(self.sa) as *mut ffi::c_void,
+            msg_namelen: mem::size_of::<libc::sockaddr_nl>() as u32,
+            msg_iov: &mut iov,
+            msg_iovlen: 1,
+            msg_control: ptr::null_mut::<ffi::c_void>(),
+            msg_controllen: 0,
+            msg_flags: 0,
+        }
     }
 }
 
@@ -250,7 +334,7 @@ pub enum RtTable {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, PackedStruct)]
+#[derive(Clone, Copy, Debug, Default, PackedStruct)]
 pub struct rtmsg {
     pub rtm_family: u8,
     pub rtm_dst_len: u8,
@@ -278,7 +362,7 @@ pub enum NlaType {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum NlaPolicyError {
+pub enum NlaPolicyError {
     Invalid,
 }
 
@@ -413,6 +497,7 @@ pub struct NlAtterData {
     data: Vec<u8>,
 }
 
+// Generic parser for netlink attributes arrays
 pub fn parse_nlas<F: Sized + NlaPolicyValidator, B: Buffer>(
     remaining_msg_bytes: &mut i64,
     msgbuf: &mut B,
@@ -420,7 +505,7 @@ pub fn parse_nlas<F: Sized + NlaPolicyValidator, B: Buffer>(
 ) -> Result<Vec<NlAtterData>, String> {
     let mut v = Vec::new();
     while *remaining_msg_bytes > 0 {
-        let nla = map_err_str!(nlattr::unpack(&msgbuf.gib_buf::<NLA_SZ>()?))?;
+        let nla = msgbuf.gib_please::<nlattr>()?;
 
         if nlavp.is_some() {
             map_err_str!(nlavp.unwrap().validate(&nla))?;
@@ -480,12 +565,10 @@ pub fn parse_msg<F: Sized + NlaPolicyValidator, B: Buffer>(
                 rt.rt_priority = *nla.data.first().unwrap();
             }
             RTA_GATEWAY => {
-                let octets = transmute_vec::<U32_SZ>(&nla.data)?;
-                rt.rta_gwy = Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]);
+                rt.rta_gwy = Ipv4Addr::new(nla.data[0], nla.data[1], nla.data[2], nla.data[3]);
             }
             RTA_DST => {
-                let octets = transmute_vec::<U32_SZ>(&nla.data)?;
-                rt.rta_dst = Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]);
+                rt.rta_dst = Ipv4Addr::new(nla.data[0], nla.data[1], nla.data[2], nla.data[3]);
             }
             RTA_OIF => {
                 rt.rta_oif = u32::from_ne_bytes(transmute_vec::<U32_SZ>(&nla.data)?);
@@ -534,18 +617,18 @@ pub fn create_nlattrs(nla_data: Vec<(NlaType, Vec<u8>)>) -> Result<Vec<u8>, Stri
     Ok(v)
 }
 
-pub fn create_nlmsg<B: Buffer>(sa: &mut sockaddr_nl, msgbuf: &mut B) -> msghdr {
-    let mut iov = iovec {
-        iov_base: msgbuf.buf_mut_ptr().cast::<c_void>(),
+pub fn create_nlmsg<B: Buffer>(sa: &mut libc::sockaddr_nl, msgbuf: &mut B) -> libc::msghdr {
+    let mut iov = libc::iovec {
+        iov_base: msgbuf.buf_mut_ptr().cast::<ffi::c_void>(),
         iov_len: msgbuf.sz(),
     };
 
-    msghdr {
-        msg_name: sa as *mut _ as *mut c_void,
-        msg_namelen: mem::size_of::<sockaddr_nl>() as u32,
+    libc::msghdr {
+        msg_name: sa as *mut _ as *mut ffi::c_void,
+        msg_namelen: mem::size_of::<libc::sockaddr_nl>() as u32,
         msg_iov: &mut iov,
         msg_iovlen: 1,
-        msg_control: ptr::null_mut::<c_void>(),
+        msg_control: ptr::null_mut::<ffi::c_void>(),
         msg_controllen: 0,
         msg_flags: 0,
     }
