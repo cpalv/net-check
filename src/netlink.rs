@@ -26,11 +26,8 @@ pub const NLGMSG_ERR_SZ: usize = mem::size_of::<nlmsgerr>();
 pub const RTMMSG_SZ: usize = mem::size_of::<rtmsg>();
 pub const IFINFO_SZ: usize = mem::size_of::<ifinfomsg>();
 pub const NLA_SZ: usize = mem::size_of::<nlattr>();
-pub const ISIZE_SZ: usize = mem::size_of::<isize>();
-pub const USIZE_SZ: usize = mem::size_of::<usize>();
 pub const U32_SZ: usize = mem::size_of::<u32>();
 pub const U16_SZ: usize = mem::size_of::<u16>();
-pub const U8_SZ: usize = mem::size_of::<u8>();
 
 #[macro_export]
 macro_rules! trust_fall {
@@ -55,7 +52,7 @@ pub const fn rust_nlmsg_align(len: u32) -> u32 {
 }
 
 pub const fn rust_is_nlmsg_aligned(len: u32) -> bool {
-    (NLMSG_HDR_SZ + (len as usize)) % 4 == 0
+    (NLMSG_HDR_SZ + (len as usize)) & (NLMSG_ALIGNTO - 1) as usize == 0
 }
 
 const SLACK: usize = 3;
@@ -93,7 +90,6 @@ impl Drop for NetlinkSocket {
         // https://man7.org/linux/man-pages/man2/close.2.html
         if trust_fall!(libc::close(self.descriptor)) < 0 {
             eprintln!("error dropping {self:?}: {}", io::Error::last_os_error());
-            return;
         }
     }
 }
@@ -121,7 +117,7 @@ impl NetlinkSocket {
 
         Ok(Self {
             descriptor: sfd,
-            sa: sa,
+            sa,
         })
     }
 
@@ -240,15 +236,15 @@ impl PackedStruct for nlmsghdr {
 
         bb.build(*src).map_err(fun)?;
 
-        tmp.nlmsg_len = u32::from_ne_bytes(bb.gib_buf::<U32_SZ>().map_err(fun)?);
+        tmp.nlmsg_len = bb.gib_checked::<u32>().map_err(fun)?;
 
-        tmp.nlmsg_type = u16::from_ne_bytes(bb.gib_buf::<U16_SZ>().map_err(fun)?);
+        tmp.nlmsg_type = bb.gib_checked::<u16>().map_err(fun)?;
 
-        tmp.nlmsg_flags = u16::from_ne_bytes(bb.gib_buf::<U16_SZ>().map_err(fun)?);
+        tmp.nlmsg_flags = bb.gib_checked::<u16>().map_err(fun)?;
 
-        tmp.nlmsg_seq = u32::from_ne_bytes(bb.gib_buf::<U32_SZ>().map_err(fun)?);
+        tmp.nlmsg_seq = bb.gib_checked::<u32>().map_err(fun)?;
 
-        tmp.nlmsg_pid = u32::from_ne_bytes(bb.gib_buf::<U32_SZ>().map_err(fun)?);
+        tmp.nlmsg_pid = bb.gib_checked::<u32>().map_err(fun)?;
 
         Ok(tmp)
     }
@@ -295,9 +291,9 @@ impl PackedStruct for nlmsgerr {
 
         bb.build(*src).map_err(fun)?;
 
-        tmp.error = isize::from_ne_bytes(bb.gib_buf::<ISIZE_SZ>().map_err(fun)?);
+        tmp.error = bb.gib_checked::<isize>().map_err(fun)?;
 
-        tmp.msg = nlmsghdr::unpack(&bb.gib_buf::<NLMSG_HDR_SZ>().map_err(fun)?)?;
+        tmp.msg = bb.gib_checked::<nlmsghdr>().map_err(fun)?;
 
         Ok(tmp)
     }
@@ -514,7 +510,7 @@ pub fn parse_nlas<F: Sized + NlaPolicyValidator, B: Buffer>(
         let nla_payload_bytes = (nla.nla_len - NLA_SZ as u16) as usize;
 
         let nlad = NlAtterData {
-            nla: nla,
+            nla,
             data: msgbuf.gib_vec(nla_payload_bytes)?,
         };
 
@@ -748,4 +744,18 @@ pub fn create_rtrequest(
     v.append(&mut nlas);
 
     Ok(v)
+}
+
+mod tests {
+    use crate::netlink;
+
+    #[test]
+    fn test_modulus() {
+        for i in 0usize..2000000 {
+            let rem0 = (netlink::NLMSG_HDR_SZ + i) % 4;
+            let rem1 = (netlink::NLMSG_HDR_SZ + i) & 3;
+
+            assert_eq!(rem0, rem1)
+        }
+    }
 }
