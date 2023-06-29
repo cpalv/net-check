@@ -103,13 +103,8 @@ macro_rules! write_impl {
             Ok(scratch)
         }
 
-        fn gib_checked<T: Copy>(&mut self) -> Result<T, String> {
-            let ptr = self.ptr_cast::<T>(true)?;
-            Ok(unsafe { *ptr })
-        }
-
-        fn gib_please<T: Copy>(&mut self) -> Result<T, String> {
-            let ptr = self.ptr_cast::<T>(false)?;
+        fn gib<T: Copy>(&mut self, strict: bool) -> Result<T, String> {
+            let ptr = self.ptr_cast::<T>(strict)?;
             Ok(unsafe { *ptr })
         }
 
@@ -177,11 +172,9 @@ pub trait Buffer {
 
     fn gib_vec(&mut self, num_bytes: usize) -> Result<Vec<u8>, String>;
 
-    fn gib_checked<T: Copy>(&mut self) -> Result<T, String>;
-
-    // useful since Buffer book keeping will not be able to track
-    // inner buffer initialization from FFI
-    fn gib_please<T: Copy>(&mut self) -> Result<T, String>;
+    // Non strict useful when inner buffer is initialization from FFI
+    // since Buffer book keeping will not be able to track
+    fn gib<T: Copy>(&mut self, strict: bool) -> Result<T, String>;
 
     fn gib_byte(&mut self) -> Result<u8, String>;
 

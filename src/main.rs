@@ -14,16 +14,20 @@ fn main() {
             eprintln!("{e}");
         }*/
 
-        if let Err(e) = netif.stats() {
+        /*if let Err(e) = netif.stats() {
             eprintln!("{e}");
-        }
+        }*/
 
         println!();
-        /*if netif.name == "enp6s0" {
+        if netif.name == "enp6s0" {
+            if let Err(e) = netif.stats() {
+                eprintln!("{e}");
+            }
+            /*
             println!("restarting {}", netif.name);
             if let Err(res) = netif.restart() {
                 eprintln!("{res}");
-            }
-        }*/
+            }*/
+        }
     }
 }

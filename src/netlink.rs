@@ -177,30 +177,30 @@ impl PackedStruct for LinkStat {
 
         bb.build(*src).map_err(fun)?;
 
-        tmp.rx_packets = bb.gib_checked::<u32>().map_err(fun)?;
-        tmp.tx_packets = bb.gib_checked::<u32>().map_err(fun)?;
-        tmp.rx_bytes = bb.gib_checked::<u32>().map_err(fun)?;
-        tmp.tx_bytes = bb.gib_checked::<u32>().map_err(fun)?;
-        tmp.rx_errors = bb.gib_checked::<u32>().map_err(fun)?;
-        tmp.tx_errors = bb.gib_checked::<u32>().map_err(fun)?;
-        tmp.rx_dropped = bb.gib_checked::<u32>().map_err(fun)?;
-        tmp.tx_dropped = bb.gib_checked::<u32>().map_err(fun)?;
-        tmp.multicast = bb.gib_checked::<u32>().map_err(fun)?;
-        tmp.collisions = bb.gib_checked::<u32>().map_err(fun)?;
-        tmp.rx_length_errors = bb.gib_checked::<u32>().map_err(fun)?;
-        tmp.rx_over_errors = bb.gib_checked::<u32>().map_err(fun)?;
-        tmp.rx_crc_errors = bb.gib_checked::<u32>().map_err(fun)?;
-        tmp.rx_frame_errors = bb.gib_checked::<u32>().map_err(fun)?;
-        tmp.rx_fifo_errors = bb.gib_checked::<u32>().map_err(fun)?;
-        tmp.rx_missed_errors = bb.gib_checked::<u32>().map_err(fun)?;
-        tmp.tx_aborted_errors = bb.gib_checked::<u32>().map_err(fun)?;
-        tmp.tx_carrier_errors = bb.gib_checked::<u32>().map_err(fun)?;
-        tmp.tx_fifo_errors = bb.gib_checked::<u32>().map_err(fun)?;
-        tmp.tx_heartbeat_errors = bb.gib_checked::<u32>().map_err(fun)?;
-        tmp.tx_window_errors = bb.gib_checked::<u32>().map_err(fun)?;
-        tmp.rx_compressed = bb.gib_checked::<u32>().map_err(fun)?;
-        tmp.tx_compressed = bb.gib_checked::<u32>().map_err(fun)?;
-        tmp.rx_nohandler = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.rx_packets = bb.gib::<u32>(true).map_err(fun)?;
+        tmp.tx_packets = bb.gib::<u32>(true).map_err(fun)?;
+        tmp.rx_bytes = bb.gib::<u32>(true).map_err(fun)?;
+        tmp.tx_bytes = bb.gib::<u32>(true).map_err(fun)?;
+        tmp.rx_errors = bb.gib::<u32>(true).map_err(fun)?;
+        tmp.tx_errors = bb.gib::<u32>(true).map_err(fun)?;
+        tmp.rx_dropped = bb.gib::<u32>(true).map_err(fun)?;
+        tmp.tx_dropped = bb.gib::<u32>(true).map_err(fun)?;
+        tmp.multicast = bb.gib::<u32>(true).map_err(fun)?;
+        tmp.collisions = bb.gib::<u32>(true).map_err(fun)?;
+        tmp.rx_length_errors = bb.gib::<u32>(true).map_err(fun)?;
+        tmp.rx_over_errors = bb.gib::<u32>(true).map_err(fun)?;
+        tmp.rx_crc_errors = bb.gib::<u32>(true).map_err(fun)?;
+        tmp.rx_frame_errors = bb.gib::<u32>(true).map_err(fun)?;
+        tmp.rx_fifo_errors = bb.gib::<u32>(true).map_err(fun)?;
+        tmp.rx_missed_errors = bb.gib::<u32>(true).map_err(fun)?;
+        tmp.tx_aborted_errors = bb.gib::<u32>(true).map_err(fun)?;
+        tmp.tx_carrier_errors = bb.gib::<u32>(true).map_err(fun)?;
+        tmp.tx_fifo_errors = bb.gib::<u32>(true).map_err(fun)?;
+        tmp.tx_heartbeat_errors = bb.gib::<u32>(true).map_err(fun)?;
+        tmp.tx_window_errors = bb.gib::<u32>(true).map_err(fun)?;
+        tmp.rx_compressed = bb.gib::<u32>(true).map_err(fun)?;
+        tmp.tx_compressed = bb.gib::<u32>(true).map_err(fun)?;
+        tmp.rx_nohandler = bb.gib::<u32>(true).map_err(fun)?;
 
         Ok(tmp)
     }
@@ -242,7 +242,7 @@ impl PackedStructInfo for LinkStat64 {
 }
 
 impl PackedStruct for LinkStat64 {
-    type ByteArray = [u8; LINKSTAT_SZ];
+    type ByteArray = [u8; LINKSTAT64_SZ];
     fn pack(&self) -> packed_struct::PackingResult<Self::ByteArray> {
         let mut bb = ByteBuffer::<LINKSTAT64_SZ>::new();
 
@@ -301,34 +301,34 @@ impl PackedStruct for LinkStat64 {
     fn unpack(src: &Self::ByteArray) -> packed_struct::PackingResult<Self> {
         let mut tmp = Self::default();
 
-        let mut bb = ByteBuffer::<LINKSTAT_SZ>::new();
+        let mut bb = ByteBuffer::<LINKSTAT64_SZ>::new();
 
         bb.build(*src).map_err(fun)?;
 
-        tmp.rx_packets = bb.gib_checked::<u64>().map_err(fun)?;
-        tmp.tx_packets = bb.gib_checked::<u64>().map_err(fun)?;
-        tmp.rx_bytes = bb.gib_checked::<u64>().map_err(fun)?;
-        tmp.tx_bytes = bb.gib_checked::<u64>().map_err(fun)?;
-        tmp.rx_errors = bb.gib_checked::<u64>().map_err(fun)?;
-        tmp.tx_errors = bb.gib_checked::<u64>().map_err(fun)?;
-        tmp.rx_dropped = bb.gib_checked::<u64>().map_err(fun)?;
-        tmp.tx_dropped = bb.gib_checked::<u64>().map_err(fun)?;
-        tmp.multicast = bb.gib_checked::<u64>().map_err(fun)?;
-        tmp.collisions = bb.gib_checked::<u64>().map_err(fun)?;
-        tmp.rx_length_errors = bb.gib_checked::<u64>().map_err(fun)?;
-        tmp.rx_over_errors = bb.gib_checked::<u64>().map_err(fun)?;
-        tmp.rx_crc_errors = bb.gib_checked::<u64>().map_err(fun)?;
-        tmp.rx_frame_errors = bb.gib_checked::<u64>().map_err(fun)?;
-        tmp.rx_fifo_errors = bb.gib_checked::<u64>().map_err(fun)?;
-        tmp.rx_missed_errors = bb.gib_checked::<u64>().map_err(fun)?;
-        tmp.tx_aborted_errors = bb.gib_checked::<u64>().map_err(fun)?;
-        tmp.tx_carrier_errors = bb.gib_checked::<u64>().map_err(fun)?;
-        tmp.tx_fifo_errors = bb.gib_checked::<u64>().map_err(fun)?;
-        tmp.tx_heartbeat_errors = bb.gib_checked::<u64>().map_err(fun)?;
-        tmp.tx_window_errors = bb.gib_checked::<u64>().map_err(fun)?;
-        tmp.rx_compressed = bb.gib_checked::<u64>().map_err(fun)?;
-        tmp.tx_compressed = bb.gib_checked::<u64>().map_err(fun)?;
-        tmp.rx_nohandler = bb.gib_checked::<u64>().map_err(fun)?;
+        tmp.rx_packets = bb.gib::<u64>(true).map_err(fun)?;
+        tmp.tx_packets = bb.gib::<u64>(true).map_err(fun)?;
+        tmp.rx_bytes = bb.gib::<u64>(true).map_err(fun)?;
+        tmp.tx_bytes = bb.gib::<u64>(true).map_err(fun)?;
+        tmp.rx_errors = bb.gib::<u64>(true).map_err(fun)?;
+        tmp.tx_errors = bb.gib::<u64>(true).map_err(fun)?;
+        tmp.rx_dropped = bb.gib::<u64>(true).map_err(fun)?;
+        tmp.tx_dropped = bb.gib::<u64>(true).map_err(fun)?;
+        tmp.multicast = bb.gib::<u64>(true).map_err(fun)?;
+        tmp.collisions = bb.gib::<u64>(true).map_err(fun)?;
+        tmp.rx_length_errors = bb.gib::<u64>(true).map_err(fun)?;
+        tmp.rx_over_errors = bb.gib::<u64>(true).map_err(fun)?;
+        tmp.rx_crc_errors = bb.gib::<u64>(true).map_err(fun)?;
+        tmp.rx_frame_errors = bb.gib::<u64>(true).map_err(fun)?;
+        tmp.rx_fifo_errors = bb.gib::<u64>(true).map_err(fun)?;
+        tmp.rx_missed_errors = bb.gib::<u64>(true).map_err(fun)?;
+        tmp.tx_aborted_errors = bb.gib::<u64>(true).map_err(fun)?;
+        tmp.tx_carrier_errors = bb.gib::<u64>(true).map_err(fun)?;
+        tmp.tx_fifo_errors = bb.gib::<u64>(true).map_err(fun)?;
+        tmp.tx_heartbeat_errors = bb.gib::<u64>(true).map_err(fun)?;
+        tmp.tx_window_errors = bb.gib::<u64>(true).map_err(fun)?;
+        tmp.rx_compressed = bb.gib::<u64>(true).map_err(fun)?;
+        tmp.tx_compressed = bb.gib::<u64>(true).map_err(fun)?;
+        tmp.rx_nohandler = bb.gib::<u64>(true).map_err(fun)?;
 
         Ok(tmp)
     }
@@ -522,15 +522,15 @@ impl PackedStruct for nlmsghdr {
 
         bb.build(*src).map_err(fun)?;
 
-        tmp.nlmsg_len = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.nlmsg_len = bb.gib::<u32>(true).map_err(fun)?;
 
-        tmp.nlmsg_type = bb.gib_checked::<u16>().map_err(fun)?;
+        tmp.nlmsg_type = bb.gib::<u16>(true).map_err(fun)?;
 
-        tmp.nlmsg_flags = bb.gib_checked::<u16>().map_err(fun)?;
+        tmp.nlmsg_flags = bb.gib::<u16>(true).map_err(fun)?;
 
-        tmp.nlmsg_seq = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.nlmsg_seq = bb.gib::<u32>(true).map_err(fun)?;
 
-        tmp.nlmsg_pid = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.nlmsg_pid = bb.gib::<u32>(true).map_err(fun)?;
 
         Ok(tmp)
     }
@@ -577,9 +577,9 @@ impl PackedStruct for nlmsgerr {
 
         bb.build(*src).map_err(fun)?;
 
-        tmp.error = bb.gib_checked::<isize>().map_err(fun)?;
+        tmp.error = bb.gib::<isize>(true).map_err(fun)?;
 
-        tmp.msg = bb.gib_checked::<nlmsghdr>().map_err(fun)?;
+        tmp.msg = bb.gib::<nlmsghdr>(true).map_err(fun)?;
 
         Ok(tmp)
     }
@@ -730,19 +730,19 @@ impl PackedStruct for ifinfomsg {
 
         bb.build(*src).map_err(fun)?;
 
-        tmp.ifi_family = bb.gib_checked::<u8>().map_err(fun)?;
+        tmp.ifi_family = bb.gib::<u8>(true).map_err(fun)?;
 
-        tmp.__ifi_pad = bb.gib_checked::<u8>().map_err(fun)?;
+        tmp.__ifi_pad = bb.gib::<u8>(true).map_err(fun)?;
 
-        tmp.ifi_type = bb.gib_checked::<u16>().map_err(fun)?;
+        tmp.ifi_type = bb.gib::<u16>(true).map_err(fun)?;
 
-        tmp.ifi_index = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.ifi_index = bb.gib::<u32>(true).map_err(fun)?;
 
-        tmp.ifi_flags = bb.gib_checked::<i16>().map_err(fun)?;
+        tmp.ifi_flags = bb.gib::<i16>(true).map_err(fun)?;
 
-        tmp.ifi_change = bb.gib_checked::<i16>().map_err(fun)?;
+        tmp.ifi_change = bb.gib::<i16>(true).map_err(fun)?;
 
-        tmp.__ifi_pad2 = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.__ifi_pad2 = bb.gib::<u32>(true).map_err(fun)?;
 
         Ok(tmp)
     }
@@ -787,7 +787,7 @@ pub fn parse_nlas<F: Sized + NlaPolicyValidator, B: Buffer>(
 ) -> Result<Vec<NlAtterData>, String> {
     let mut v = Vec::new();
     while *remaining_msg_bytes > 0 {
-        let nla = msgbuf.gib_please::<nlattr>()?;
+        let nla = msgbuf.gib::<nlattr>(false)?;
 
         if nlavp.is_some() {
             map_err_str!(nlavp.unwrap().validate(&nla))?;

@@ -19,14 +19,12 @@ use nix::libc::{
 use nix::net::if_::InterfaceFlags;
 use nix::sys::socket::{AddressFamily, SockaddrLike, SockaddrStorage};
 
-use ::packed_struct::PackedStruct;
-
 use crate::buffer::{transmute_vec, Buffer, ByteBuffer, ByteVec};
 use crate::netlink;
 use crate::netlink::{
-    create_nlmsg, create_rtrequest, ifinfomsg, nlattr, nlmsghdr, parse_nlas, rtmsg, LinkStat,
+    create_nlmsg, create_rtrequest, ifinfomsg, nlattr, nlmsghdr, rtmsg, LinkStat,
     LinkStat64, NetlinkSocket, NlaPolicy, NlaPolicyValidator, NlaType, NlmsgType, Route, RtScope,
-    RtmProtocol, RtnType, LINKSTAT_SZ, LINKSTAT64_SZ,NLA_SZ, NLMSG_HDR_SZ, RTMMSG_SZ, U32_SZ,
+    RtmProtocol, RtnType, NLA_SZ, NLMSG_HDR_SZ, RTMMSG_SZ, U32_SZ,
 };
 
 const KB: usize = 1024;
@@ -45,6 +43,32 @@ pub fn errstring<E: ToString>(err: E) -> String {
 macro_rules! map_err_str {
     ($e:expr) => {
         $e.map_err($crate::nic::errstring)
+    };
+}
+
+macro_rules! parse {
+    ($buf:ident, $remaining_bytes:ident, $($search:ident => $match_arms:block)+) => {
+        while $remaining_bytes > 0 {
+            let nla = $buf.gib::<nlattr>(false)?;
+
+            if nla.nla_len < NLA_SZ as u16 {
+                return Err(format!("unable to parse netlink attributes, nla must be at least {NLA_SZ} bytes + data, it is likely that either alignment or parsing is off"))
+            }
+
+            let nla_payload_bytes = (nla.nla_len - NLA_SZ as u16) as usize;
+
+            let aligned_payload = netlink::rust_nla_align(nla_payload_bytes as i32);
+
+            match nla.nla_type {
+                $($search => $match_arms)+
+                _ => {
+                    $buf.incr(nla_payload_bytes);
+                    $buf.incr((aligned_payload as usize) - nla_payload_bytes);
+                }
+            };
+
+            $remaining_bytes -= ((NLA_SZ as i32) + aligned_payload) as i64;
+        }
     };
 }
 
@@ -107,8 +131,8 @@ fn parse_msg<F: Sized + NlaPolicyValidator, B: Buffer>(
     msgbuf: &mut B,
     nlavp: Option<&F>,
 ) -> Result<Route, String> {
-    let nlhr = msgbuf.gib_please::<nlmsghdr>()?;
-    let rtm = msgbuf.gib_please::<rtmsg>()?;
+    let nlhr = msgbuf.gib::<nlmsghdr>(false)?;
+    let rtm = msgbuf.gib::<rtmsg>(false)?;
 
     // parse remaining nlattr structs
     let msg_bytes = nlhr.nlmsg_len as i64;
@@ -122,7 +146,7 @@ fn parse_msg<F: Sized + NlaPolicyValidator, B: Buffer>(
     };
 
     while remaining_msg_bytes > 0 {
-        let nla = msgbuf.gib_please::<nlattr>()?;
+        let nla = msgbuf.gib::<nlattr>(false)?;
 
         if nlavp.is_some() {
             nlavp.unwrap().validate(&nla).map_err(errstring)?;
@@ -240,8 +264,7 @@ fn get_gateway(ifname: [i8; IFNAMSIZ]) -> Option<SockaddrStorage> {
             eprintln!("Ok.. thats enough: {e}");
             return None;
         }
-        let new_buf_sz = msgbuf.sz() * 4;
-        msgbuf = ByteVec::new(new_buf_sz);
+        msgbuf.realloc(4);
         mhdr = create_nlmsg(&mut sa, &mut msgbuf);
 
         rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC);
@@ -807,20 +830,22 @@ impl NetworkInterface {
             Err(e) => return Err(format!("{e}")),
         };
 
-        let nlhr = msgbuf.gib_please::<nlmsghdr>()?;
-        let _ = msgbuf.gib_please::<ifinfomsg>()?;
+        let nlhr = msgbuf.gib::<nlmsghdr>(false)?;
+        let _ = msgbuf.gib::<ifinfomsg>(false)?;
 
         let ifm_sz = mem::size_of::<ifinfomsg>();
         let msg_bytes = nlhr.nlmsg_len as i64;
 
         let mut remaining_msg_bytes = msg_bytes - ((NLMSG_HDR_SZ + ifm_sz) as i64);
 
-        let nlas = parse_nlas::<NlaPolicy, ByteVec>(&mut remaining_msg_bytes, &mut msgbuf, None)?;
+        let mut stats = None;
+        parse!(msgbuf, remaining_msg_bytes, IFLA_STATS => {
+            stats = Some(msgbuf.gib::<LinkStat>(false)?);
+            break;
+        });
 
-        if let Some(stats_attr) = nlas.iter().find(|&nla| nla.nla.nla_type == IFLA_STATS) {
-            let link_stat = LinkStat::unpack(&transmute_vec::<LINKSTAT_SZ>(&stats_attr.data)?)
-                .map_err(errstring)?;
-            println!("link stat: {link_stat:?}");
+        if stats.is_some() {
+            println!("{:?}", stats.unwrap());
         }
 
         Ok(())
@@ -863,20 +888,22 @@ impl NetworkInterface {
             Err(e) => return Err(format!("{e}")),
         };
 
-        let nlhr = msgbuf.gib_please::<nlmsghdr>()?;
-        let _ = msgbuf.gib_please::<ifinfomsg>()?;
+        let nlhr = msgbuf.gib::<nlmsghdr>(false)?;
+        let _ = msgbuf.gib::<ifinfomsg>(false)?;
 
         let ifm_sz = mem::size_of::<ifinfomsg>();
         let msg_bytes = nlhr.nlmsg_len as i64;
 
         let mut remaining_msg_bytes = msg_bytes - ((NLMSG_HDR_SZ + ifm_sz) as i64);
 
-        let nlas = parse_nlas::<NlaPolicy, ByteVec>(&mut remaining_msg_bytes, &mut msgbuf, None)?;
+        let mut stats = None;
+        parse!(msgbuf, remaining_msg_bytes, IFLA_STATS64 => {
+            stats = Some(msgbuf.gib::<LinkStat64>(false)?);
+            break;
+        });
 
-        if let Some(stats_attr) = nlas.iter().find(|&nla| nla.nla.nla_type == IFLA_STATS) {
-            let link_stat = LinkStat64::unpack(&transmute_vec::<LINKSTAT64_SZ>(&stats_attr.data)?)
-                .map_err(errstring)?;
-            println!("link stat: {link_stat:?}");
+        if stats.is_some() {
+            println!("{:?}", stats.unwrap());
         }
 
         Ok(())
