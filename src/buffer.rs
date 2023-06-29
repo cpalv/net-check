@@ -1,6 +1,6 @@
 use std::mem;
 
-use crate::netlink::{NLMSG_HDR_SZ, RTMMSG_SZ, U16_SZ, U32_SZ};
+use crate::netlink::{LINKSTAT64_SZ, LINKSTAT_SZ, NLMSG_HDR_SZ, RTMMSG_SZ, U16_SZ, U32_SZ};
 
 macro_rules! write_impl {
     () => {
@@ -93,10 +93,10 @@ macro_rules! write_impl {
                 return Err(String::from("End index exceeds buffer"));
             }
 
-            let mut scratch = Vec::with_capacity(num_bytes);
+            let mut scratch = vec![0; num_bytes];
 
-            for byte in self.buf[self.current_idx..end_idx].iter() {
-                scratch.push(*byte);
+            for (i, byte) in self.buf[self.current_idx..end_idx].iter().enumerate() {
+                scratch[i] = *byte;
             }
 
             self.current_idx += num_bytes;
@@ -141,7 +141,7 @@ macro_rules! impl_buff {
 pub fn transmute_vec<const NUM_BYTES: usize>(s: &[u8]) -> Result<[u8; NUM_BYTES], String> {
     let mut scratch = [0; NUM_BYTES];
     match s.len() {
-        U16_SZ | U32_SZ | NLMSG_HDR_SZ | RTMMSG_SZ => {
+        U16_SZ | U32_SZ | NLMSG_HDR_SZ | RTMMSG_SZ | LINKSTAT_SZ | LINKSTAT64_SZ => {
             for (i, byte) in s.iter().enumerate() {
                 scratch[i] = *byte;
             }

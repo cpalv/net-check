@@ -10,7 +10,11 @@ fn main() {
     }
 
     for netif in netifs {
-        if let Err(e) = netif.show_routes() {
+        /*if let Err(e) = netif.show_routes() {
+            eprintln!("{e}");
+        }*/
+
+        if let Err(e) = netif.stats() {
             eprintln!("{e}");
         }
 

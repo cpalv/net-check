@@ -25,6 +25,8 @@ pub const NLMSG_HDR_SZ: usize = mem::size_of::<nlmsghdr>();
 pub const NLGMSG_ERR_SZ: usize = mem::size_of::<nlmsgerr>();
 pub const RTMMSG_SZ: usize = mem::size_of::<rtmsg>();
 pub const IFINFO_SZ: usize = mem::size_of::<ifinfomsg>();
+pub const LINKSTAT_SZ: usize = mem::size_of::<LinkStat>();
+pub const LINKSTAT64_SZ: usize = mem::size_of::<LinkStat64>();
 pub const NLA_SZ: usize = mem::size_of::<nlattr>();
 pub const U32_SZ: usize = mem::size_of::<u32>();
 pub const U16_SZ: usize = mem::size_of::<u16>();
@@ -73,6 +75,262 @@ impl fmt::Display for RecvErr {
             Self::OsErr(s) => write!(f, "{s}"),
             Self::MsgTrunc => write!(f, "Message truncated"),
         }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LinkStat {
+    rx_packets: u32,
+    tx_packets: u32,
+    rx_bytes: u32,
+    tx_bytes: u32,
+    rx_errors: u32,
+    tx_errors: u32,
+    rx_dropped: u32,
+    tx_dropped: u32,
+    multicast: u32,
+    collisions: u32,
+    rx_length_errors: u32,
+    rx_over_errors: u32,
+    rx_crc_errors: u32,
+    rx_frame_errors: u32,
+    rx_fifo_errors: u32,
+    rx_missed_errors: u32,
+    tx_aborted_errors: u32,
+    tx_carrier_errors: u32,
+    tx_fifo_errors: u32,
+    tx_heartbeat_errors: u32,
+    tx_window_errors: u32,
+    rx_compressed: u32,
+    tx_compressed: u32,
+    rx_nohandler: u32,
+}
+
+impl PackedStructInfo for LinkStat {
+    fn packed_bits() -> usize {
+        LINKSTAT_SZ * 8
+    }
+}
+
+impl PackedStruct for LinkStat {
+    type ByteArray = [u8; LINKSTAT_SZ];
+    fn pack(&self) -> packed_struct::PackingResult<Self::ByteArray> {
+        let mut bb = ByteBuffer::<LINKSTAT_SZ>::new();
+
+        bb.build(self.rx_packets.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.tx_packets.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.rx_bytes.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.tx_bytes.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.rx_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.tx_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.rx_dropped.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.tx_dropped.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.multicast.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.collisions.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.rx_length_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.rx_over_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.rx_crc_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.rx_frame_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.rx_fifo_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.rx_missed_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.tx_aborted_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.tx_carrier_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.tx_fifo_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.tx_heartbeat_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.tx_window_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.rx_compressed.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.tx_compressed.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.rx_nohandler.to_ne_bytes())
+            .map_err(fun)?;
+
+        Ok(bb.buf)
+    }
+
+    fn unpack(src: &Self::ByteArray) -> packed_struct::PackingResult<Self> {
+        let mut tmp = Self::default();
+
+        let mut bb = ByteBuffer::<LINKSTAT_SZ>::new();
+
+        bb.build(*src).map_err(fun)?;
+
+        tmp.rx_packets = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.tx_packets = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.rx_bytes = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.tx_bytes = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.rx_errors = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.tx_errors = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.rx_dropped = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.tx_dropped = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.multicast = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.collisions = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.rx_length_errors = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.rx_over_errors = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.rx_crc_errors = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.rx_frame_errors = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.rx_fifo_errors = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.rx_missed_errors = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.tx_aborted_errors = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.tx_carrier_errors = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.tx_fifo_errors = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.tx_heartbeat_errors = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.tx_window_errors = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.rx_compressed = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.tx_compressed = bb.gib_checked::<u32>().map_err(fun)?;
+        tmp.rx_nohandler = bb.gib_checked::<u32>().map_err(fun)?;
+
+        Ok(tmp)
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LinkStat64 {
+    rx_packets: u64,
+    tx_packets: u64,
+    rx_bytes: u64,
+    tx_bytes: u64,
+    rx_errors: u64,
+    tx_errors: u64,
+    rx_dropped: u64,
+    tx_dropped: u64,
+    multicast: u64,
+    collisions: u64,
+    rx_length_errors: u64,
+    rx_over_errors: u64,
+    rx_crc_errors: u64,
+    rx_frame_errors: u64,
+    rx_fifo_errors: u64,
+    rx_missed_errors: u64,
+    tx_aborted_errors: u64,
+    tx_carrier_errors: u64,
+    tx_fifo_errors: u64,
+    tx_heartbeat_errors: u64,
+    tx_window_errors: u64,
+    rx_compressed: u64,
+    tx_compressed: u64,
+    rx_nohandler: u64,
+}
+
+impl PackedStructInfo for LinkStat64 {
+    fn packed_bits() -> usize {
+        LINKSTAT64_SZ * 8
+    }
+}
+
+impl PackedStruct for LinkStat64 {
+    type ByteArray = [u8; LINKSTAT_SZ];
+    fn pack(&self) -> packed_struct::PackingResult<Self::ByteArray> {
+        let mut bb = ByteBuffer::<LINKSTAT64_SZ>::new();
+
+        bb.build(self.rx_packets.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.tx_packets.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.rx_bytes.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.tx_bytes.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.rx_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.tx_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.rx_dropped.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.tx_dropped.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.multicast.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.collisions.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.rx_length_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.rx_over_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.rx_crc_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.rx_frame_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.rx_fifo_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.rx_missed_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.tx_aborted_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.tx_carrier_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.tx_fifo_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.tx_heartbeat_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.tx_window_errors.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.rx_compressed.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.tx_compressed.to_ne_bytes())
+            .map_err(fun)?
+            .build(self.rx_nohandler.to_ne_bytes())
+            .map_err(fun)?;
+
+        Ok(bb.buf)
+    }
+
+    fn unpack(src: &Self::ByteArray) -> packed_struct::PackingResult<Self> {
+        let mut tmp = Self::default();
+
+        let mut bb = ByteBuffer::<LINKSTAT_SZ>::new();
+
+        bb.build(*src).map_err(fun)?;
+
+        tmp.rx_packets = bb.gib_checked::<u64>().map_err(fun)?;
+        tmp.tx_packets = bb.gib_checked::<u64>().map_err(fun)?;
+        tmp.rx_bytes = bb.gib_checked::<u64>().map_err(fun)?;
+        tmp.tx_bytes = bb.gib_checked::<u64>().map_err(fun)?;
+        tmp.rx_errors = bb.gib_checked::<u64>().map_err(fun)?;
+        tmp.tx_errors = bb.gib_checked::<u64>().map_err(fun)?;
+        tmp.rx_dropped = bb.gib_checked::<u64>().map_err(fun)?;
+        tmp.tx_dropped = bb.gib_checked::<u64>().map_err(fun)?;
+        tmp.multicast = bb.gib_checked::<u64>().map_err(fun)?;
+        tmp.collisions = bb.gib_checked::<u64>().map_err(fun)?;
+        tmp.rx_length_errors = bb.gib_checked::<u64>().map_err(fun)?;
+        tmp.rx_over_errors = bb.gib_checked::<u64>().map_err(fun)?;
+        tmp.rx_crc_errors = bb.gib_checked::<u64>().map_err(fun)?;
+        tmp.rx_frame_errors = bb.gib_checked::<u64>().map_err(fun)?;
+        tmp.rx_fifo_errors = bb.gib_checked::<u64>().map_err(fun)?;
+        tmp.rx_missed_errors = bb.gib_checked::<u64>().map_err(fun)?;
+        tmp.tx_aborted_errors = bb.gib_checked::<u64>().map_err(fun)?;
+        tmp.tx_carrier_errors = bb.gib_checked::<u64>().map_err(fun)?;
+        tmp.tx_fifo_errors = bb.gib_checked::<u64>().map_err(fun)?;
+        tmp.tx_heartbeat_errors = bb.gib_checked::<u64>().map_err(fun)?;
+        tmp.tx_window_errors = bb.gib_checked::<u64>().map_err(fun)?;
+        tmp.rx_compressed = bb.gib_checked::<u64>().map_err(fun)?;
+        tmp.tx_compressed = bb.gib_checked::<u64>().map_err(fun)?;
+        tmp.rx_nohandler = bb.gib_checked::<u64>().map_err(fun)?;
+
+        Ok(tmp)
     }
 }
 
@@ -152,17 +410,45 @@ impl NetlinkSocket {
         Ok(self)
     }
 
-    pub fn recvmsg(&self, msghdr: *mut libc::msghdr, flags: i32) -> Result<usize, RecvErr> {
-        let len = trust_fall!(libc::recvmsg(self.descriptor, msghdr, flags));
+    pub fn recvmsg(&self, mut msghdr: libc::msghdr, flags: i32) -> Result<usize, RecvErr> {
+        let len = trust_fall!(libc::recvmsg(
+            self.descriptor,
+            ptr::addr_of_mut!(msghdr),
+            flags
+        ));
         if len < 0 {
             return Err(RecvErr::OsErr(io::Error::last_os_error().to_string()));
         }
 
-        if trust_fall!((*msghdr).msg_flags) == libc::MSG_TRUNC {
+        if msghdr.msg_flags == libc::MSG_TRUNC {
             return Err(RecvErr::MsgTrunc);
         }
 
         Ok(len as usize)
+    }
+
+    pub fn sendmsg(&mut self, v: Vec<u8>, flags: i32) -> io::Result<usize> {
+        let mut iov = libc::iovec {
+            iov_base: v.as_ptr() as *mut ffi::c_void,
+            iov_len: v.len(),
+        };
+
+        let mhdr = libc::msghdr {
+            msg_name: &mut self.sa as *mut _ as *mut ffi::c_void,
+            msg_namelen: mem::size_of::<libc::sockaddr_nl>() as u32,
+            msg_iov: &mut iov,
+            msg_iovlen: 1,
+            msg_control: ptr::null_mut::<ffi::c_void>(),
+            msg_controllen: 0,
+            msg_flags: 0,
+        };
+
+        let sent_bytes = trust_fall!(libc::sendmsg(self.descriptor, &mhdr, flags));
+        if sent_bytes < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(sent_bytes as usize)
     }
 
     pub fn create_msg<B: Buffer>(&mut self, msgbuf: &mut B) -> libc::msghdr {
@@ -489,8 +775,8 @@ impl Default for Route {
 
 #[derive(Debug)]
 pub struct NlAtterData {
-    nla: nlattr,
-    data: Vec<u8>,
+    pub nla: nlattr,
+    pub data: Vec<u8>,
 }
 
 // Generic parser for netlink attributes arrays

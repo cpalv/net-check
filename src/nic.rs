@@ -10,20 +10,23 @@ use std::{mem, ptr, thread};
 use nix::ifaddrs::{self, InterfaceAddress};
 use nix::libc::{
     bind, close, if_indextoname, if_nametoindex, ifreq, ioctl, msghdr, recvmsg, sendto, sockaddr,
-    sockaddr_nl, socket, AF_INET, AF_NETLINK, IFF_UP, IFNAMSIZ, IPPROTO_IP, MSG_PEEK, MSG_TRUNC,
-    NETLINK_ROUTE, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REQUEST, RTA_DST,
-    RTA_GATEWAY, RTA_OIF, RTA_PRIORITY, RTA_TABLE, RT_TABLE_MAIN, SIOCGIFFLAGS, SIOCSIFFLAGS,
+    sockaddr_nl, socket, AF_INET, AF_NETLINK, ARPHRD_NETROM, IFF_UP, IFLA_STATS, IFLA_STATS64,
+    IFNAMSIZ, IPPROTO_IP, MSG_PEEK, MSG_TRUNC, NETLINK_ROUTE, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP,
+    NLM_F_EXCL, NLM_F_REQUEST, RTA_DST, RTA_GATEWAY, RTA_OIF, RTA_PRIORITY, RTA_TABLE,
+    RTEXT_FILTER_SKIP_STATS, RTEXT_FILTER_VF, RT_TABLE_MAIN, SIOCGIFFLAGS, SIOCSIFFLAGS,
     SOCK_CLOEXEC, SOCK_DGRAM, SOCK_RAW,
 };
 use nix::net::if_::InterfaceFlags;
 use nix::sys::socket::{AddressFamily, SockaddrLike, SockaddrStorage};
 
+use ::packed_struct::PackedStruct;
+
 use crate::buffer::{transmute_vec, Buffer, ByteBuffer, ByteVec};
 use crate::netlink;
 use crate::netlink::{
-    create_nlmsg, create_rtrequest, nlattr, nlmsghdr, rtmsg, NetlinkSocket, NlaPolicy,
-    NlaPolicyValidator, NlaType, NlmsgType, Route, RtScope, RtmProtocol, RtnType, NLA_SZ,
-    NLMSG_HDR_SZ, RTMMSG_SZ, U32_SZ,
+    create_nlmsg, create_rtrequest, ifinfomsg, nlattr, nlmsghdr, parse_nlas, rtmsg, LinkStat,
+    LinkStat64, NetlinkSocket, NlaPolicy, NlaPolicyValidator, NlaType, NlmsgType, Route, RtScope,
+    RtmProtocol, RtnType, LINKSTAT_SZ, LINKSTAT64_SZ,NLA_SZ, NLMSG_HDR_SZ, RTMMSG_SZ, U32_SZ,
 };
 
 const KB: usize = 1024;
@@ -592,7 +595,7 @@ impl NetworkInterface {
         let mut msgbuf = ByteBuffer::<BUF_SZ>::new();
         let mut mhdr = nls.create_msg(&mut msgbuf);
 
-        let rx_bytes = match nls.recvmsg(ptr::addr_of_mut!(mhdr), MSG_PEEK | MSG_TRUNC) {
+        let rx_bytes = match nls.recvmsg(mhdr, MSG_PEEK | MSG_TRUNC) {
             Ok(recvd) => recvd,
             Err(e) => return Err(format!("{e}")),
         };
@@ -697,7 +700,7 @@ impl NetworkInterface {
         let mut msgbuf = ByteBuffer::<BUF_SZ>::new();
         let mut mhdr = nls.create_msg(&mut msgbuf);
 
-        let rx_bytes = match nls.recvmsg(ptr::addr_of_mut!(mhdr), MSG_PEEK | MSG_TRUNC) {
+        let rx_bytes = match nls.recvmsg(mhdr, MSG_PEEK | MSG_TRUNC) {
             Ok(recvd) => recvd,
             Err(e) => return Err(format!("{e}")),
         };
@@ -723,7 +726,7 @@ impl NetworkInterface {
             vec![(NlaType::RtaTable, vec![RT_TABLE_MAIN])],
         ) {
             Ok(v) => v,
-            Err(e) => return Err(Error::new(io::ErrorKind::OutOfMemory, e.to_string())),
+            Err(e) => return Err(Error::new(io::ErrorKind::OutOfMemory, e)),
         };
 
         nls.sendto(v, 0)?;
@@ -731,12 +734,12 @@ impl NetworkInterface {
         let mut msgbuf = ByteVec::new(BUF_SZ);
         let mut mhdr = nls.create_msg(&mut msgbuf);
 
-        let mut rx_bytes = nls.recvmsg(ptr::addr_of_mut!(mhdr), MSG_PEEK | MSG_TRUNC);
+        let mut rx_bytes = nls.recvmsg(mhdr, MSG_PEEK | MSG_TRUNC);
 
         while let Err(e) = rx_bytes {
             match e {
                 netlink::RecvErr::OsErr(s) => {
-                    return Err(Error::new(io::ErrorKind::OutOfMemory, s.to_string()))
+                    return Err(Error::new(io::ErrorKind::OutOfMemory, s))
                 }
                 netlink::RecvErr::MsgTrunc => {
                     if msgbuf.sz() > TB {
@@ -748,7 +751,7 @@ impl NetworkInterface {
                     msgbuf.realloc(4);
                     mhdr = nls.create_msg(&mut msgbuf);
 
-                    rx_bytes = nls.recvmsg(ptr::addr_of_mut!(mhdr), MSG_PEEK | MSG_TRUNC);
+                    rx_bytes = nls.recvmsg(mhdr, MSG_PEEK | MSG_TRUNC);
                 }
             }
         }
@@ -762,6 +765,118 @@ impl NetworkInterface {
 
             println!("Route {i}: {rt:?}");
             i += 1;
+        }
+
+        Ok(())
+    }
+
+    pub fn stats(&self) -> Result<(), String> {
+        let mut nls = match NetlinkSocket::new() {
+            Ok(netlink_socket) => netlink_socket,
+            Err(e) => return Err(e.to_string()),
+        };
+
+        match nls.bind() {
+            Ok(_) => {}
+            Err(e) => return Err(e.to_string()),
+        };
+
+        let v = netlink::create_ifirequest(
+            NlmsgType::RtmGetLink,
+            NLM_F_REQUEST as u16,
+            ARPHRD_NETROM as u16,
+            self.if_idx,
+            0,
+            0,
+            vec![(
+                NlaType::IflaExtMask,
+                vec![((RTEXT_FILTER_VF | RTEXT_FILTER_SKIP_STATS) as u8)],
+            )],
+        )?;
+
+        match nls.sendmsg(v, 0) {
+            Ok(_) => {}
+            Err(e) => return Err(format!("{e}")),
+        };
+
+        let mut msgbuf = ByteVec::new(BUF_SZ);
+        let mhdr = nls.create_msg(&mut msgbuf);
+
+        let rx_bytes = match nls.recvmsg(mhdr, MSG_PEEK | MSG_TRUNC) {
+            Ok(recvd) => recvd,
+            Err(e) => return Err(format!("{e}")),
+        };
+
+        let nlhr = msgbuf.gib_please::<nlmsghdr>()?;
+        let _ = msgbuf.gib_please::<ifinfomsg>()?;
+
+        let ifm_sz = mem::size_of::<ifinfomsg>();
+        let msg_bytes = nlhr.nlmsg_len as i64;
+
+        let mut remaining_msg_bytes = msg_bytes - ((NLMSG_HDR_SZ + ifm_sz) as i64);
+
+        let nlas = parse_nlas::<NlaPolicy, ByteVec>(&mut remaining_msg_bytes, &mut msgbuf, None)?;
+
+        if let Some(stats_attr) = nlas.iter().find(|&nla| nla.nla.nla_type == IFLA_STATS) {
+            let link_stat = LinkStat::unpack(&transmute_vec::<LINKSTAT_SZ>(&stats_attr.data)?)
+                .map_err(errstring)?;
+            println!("link stat: {link_stat:?}");
+        }
+
+        Ok(())
+    }
+
+    pub fn stats64(&self) -> Result<(), String> {
+        let mut nls = match NetlinkSocket::new() {
+            Ok(netlink_socket) => netlink_socket,
+            Err(e) => return Err(e.to_string()),
+        };
+
+        match nls.bind() {
+            Ok(_) => {}
+            Err(e) => return Err(e.to_string()),
+        };
+
+        let v = netlink::create_ifirequest(
+            NlmsgType::RtmGetLink,
+            NLM_F_REQUEST as u16,
+            ARPHRD_NETROM as u16,
+            self.if_idx,
+            0,
+            0,
+            vec![(
+                NlaType::IflaExtMask,
+                vec![((RTEXT_FILTER_VF | RTEXT_FILTER_SKIP_STATS) as u8)],
+            )],
+        )?;
+
+        match nls.sendmsg(v, 0) {
+            Ok(_) => {}
+            Err(e) => return Err(format!("{e}")),
+        };
+
+        let mut msgbuf = ByteVec::new(BUF_SZ);
+        let mhdr = nls.create_msg(&mut msgbuf);
+
+        let rx_bytes = match nls.recvmsg(mhdr, MSG_PEEK | MSG_TRUNC) {
+            Ok(recvd) => recvd,
+            Err(e) => return Err(format!("{e}")),
+        };
+
+        let nlhr = msgbuf.gib_please::<nlmsghdr>()?;
+        let _ = msgbuf.gib_please::<ifinfomsg>()?;
+
+        let ifm_sz = mem::size_of::<ifinfomsg>();
+        let msg_bytes = nlhr.nlmsg_len as i64;
+
+        let mut remaining_msg_bytes = msg_bytes - ((NLMSG_HDR_SZ + ifm_sz) as i64);
+
+        let nlas = parse_nlas::<NlaPolicy, ByteVec>(&mut remaining_msg_bytes, &mut msgbuf, None)?;
+
+        if let Some(stats_attr) = nlas.iter().find(|&nla| nla.nla.nla_type == IFLA_STATS) {
+            let link_stat = LinkStat64::unpack(&transmute_vec::<LINKSTAT64_SZ>(&stats_attr.data)?)
+                .map_err(errstring)?;
+            println!("link stat: {link_stat:?}");
         }
 
         Ok(())
