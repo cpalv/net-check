@@ -289,15 +289,15 @@ mod tests {
 
             bb.build(*src).map_err(fun)?;
 
-            tmp.nlmsg_len = bb.gib_checked::<u32>().map_err(fun)?;
+            tmp.nlmsg_len = bb.gib::<u32>(true).map_err(fun)?;
 
-            tmp.nlmsg_type = bb.gib_checked::<u16>().map_err(fun)?;
+            tmp.nlmsg_type = bb.gib::<u16>(true).map_err(fun)?;
 
-            tmp.nlmsg_flags = bb.gib_checked::<u16>().map_err(fun)?;
+            tmp.nlmsg_flags = bb.gib::<u16>(true).map_err(fun)?;
 
-            tmp.nlmsg_seq = bb.gib_checked::<u32>().map_err(fun)?;
+            tmp.nlmsg_seq = bb.gib::<u32>(true).map_err(fun)?;
 
-            tmp.nlmsg_pid = bb.gib_checked::<u32>().map_err(fun)?;
+            tmp.nlmsg_pid = bb.gib::<u32>(true).map_err(fun)?;
 
             Ok(tmp)
         }
@@ -485,5 +485,32 @@ mod tests {
         let msg = bb.box_pup::<nlmsghdr>().unwrap();
 
         assert_eq!(n, *(msg.as_ref()))
+    }
+
+    #[test]
+    fn test_cast_buf() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32;
+
+        let n = nlmsghdr {
+            nlmsg_len: 30,
+            nlmsg_type: 5,
+            nlmsg_flags: 10,
+            nlmsg_seq: now,
+            nlmsg_pid: 0,
+        };
+
+        let mut bb = ByteVec::new(32);
+        let np = bb.ptr_cast::<nlmsghdr>(false).unwrap() as *mut nlmsghdr;
+
+
+        unsafe { *np = n }
+
+        bb.reset();
+        let nl = bb.gib::<nlmsghdr>(false).unwrap();
+        
+        assert_eq!(n, nl)
     }
 }

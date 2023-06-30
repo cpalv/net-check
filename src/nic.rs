@@ -1,20 +1,17 @@
 use core::fmt;
 
-use std::ffi::c_void;
 use std::io;
 use std::io::Error;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
-use std::{mem, ptr, thread};
+use std::{mem, thread};
 
 use nix::ifaddrs::{self, InterfaceAddress};
 use nix::libc::{
-    bind, close, if_indextoname, if_nametoindex, ifreq, ioctl, msghdr, recvmsg, sendto, sockaddr,
-    sockaddr_nl, socket, AF_INET, AF_NETLINK, ARPHRD_NETROM, IFF_UP, IFLA_STATS, IFLA_STATS64,
-    IFNAMSIZ, IPPROTO_IP, MSG_PEEK, MSG_TRUNC, NETLINK_ROUTE, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP,
-    NLM_F_EXCL, NLM_F_REQUEST, RTA_DST, RTA_GATEWAY, RTA_OIF, RTA_PRIORITY, RTA_TABLE,
-    RTEXT_FILTER_SKIP_STATS, RTEXT_FILTER_VF, RT_TABLE_MAIN, SIOCGIFFLAGS, SIOCSIFFLAGS,
-    SOCK_CLOEXEC, SOCK_DGRAM, SOCK_RAW,
+    if_indextoname, if_nametoindex, ifreq, ioctl, sockaddr_nl, ARPHRD_NETROM, IFF_UP, IFLA_STATS,
+    IFLA_STATS64, IFNAMSIZ, MSG_PEEK, MSG_TRUNC, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL,
+    NLM_F_REQUEST, RTA_DST, RTA_GATEWAY, RTA_OIF, RTA_PRIORITY, RTA_TABLE, RTEXT_FILTER_SKIP_STATS,
+    RTEXT_FILTER_VF, RT_TABLE_MAIN, SIOCGIFFLAGS, SIOCSIFFLAGS,
 };
 use nix::net::if_::InterfaceFlags;
 use nix::sys::socket::{AddressFamily, SockaddrLike, SockaddrStorage};
@@ -22,9 +19,9 @@ use nix::sys::socket::{AddressFamily, SockaddrLike, SockaddrStorage};
 use crate::buffer::{transmute_vec, Buffer, ByteBuffer, ByteVec};
 use crate::netlink;
 use crate::netlink::{
-    create_nlmsg, create_rtrequest, ifinfomsg, nlattr, nlmsghdr, rtmsg, LinkStat,
-    LinkStat64, NetlinkSocket, NlaPolicy, NlaPolicyValidator, NlaType, NlmsgType, Route, RtScope,
-    RtmProtocol, RtnType, NLA_SZ, NLMSG_HDR_SZ, RTMMSG_SZ, U32_SZ,
+    create_rtrequest, ifinfomsg, nlattr, nlmsghdr, rtmsg, LinkStat, LinkStat64, NlaPolicy,
+    NlaPolicyValidator, NlaType, NlmsgType, Route, RtScope, RtmProtocol, RtnType, NLA_SZ,
+    NLMSG_HDR_SZ, RTMMSG_SZ, U32_SZ,
 };
 
 const KB: usize = 1024;
@@ -33,7 +30,6 @@ const GB: usize = 1024 * MB;
 const TB: usize = 1024 * GB;
 
 const BUF_SZ: usize = 8 * KB;
-const SLACK: usize = 3;
 
 pub fn errstring<E: ToString>(err: E) -> String {
     format!("{}:{} {}", file!(), line!(), err.to_string())
@@ -70,60 +66,6 @@ macro_rules! parse {
             $remaining_bytes -= ((NLA_SZ as i32) + aligned_payload) as i64;
         }
     };
-}
-
-fn quick_socket(domain: i32, sock_type: i32, protocol: i32) -> Result<i32, String> {
-    let sfd = unsafe { socket(domain, sock_type, protocol) };
-    if sfd < 0 {
-        return Err(Error::last_os_error().to_string());
-    }
-    Ok(sfd)
-}
-
-fn checked_bind(sfd: i32, sa: *const sockaddr, addr_len: u32) -> Result<(), String> {
-    let rc = unsafe { bind(sfd, sa, addr_len) };
-
-    if rc < 0 {
-        return Err(Error::last_os_error().to_string());
-    }
-    Ok(())
-}
-
-fn checked_sendto(sfd: i32, buf: *const c_void, buf_len: usize, flags: i32) -> Result<(), String> {
-    let rc = unsafe { sendto(sfd, buf, buf_len, flags, ptr::null::<sockaddr>(), 0) };
-
-    if rc < 0 {
-        return Err(Error::last_os_error().to_string());
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone)]
-enum RecvErr {
-    OsErr(String),
-    MsgTrunc,
-}
-
-impl fmt::Display for RecvErr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::OsErr(s) => write!(f, "{s}"),
-            Self::MsgTrunc => write!(f, "Message truncated"),
-        }
-    }
-}
-
-fn recv_nlmsg(sfd: i32, mhdr: *mut msghdr, flags: i32) -> Result<usize, RecvErr> {
-    let len = unsafe { recvmsg(sfd, mhdr, flags) };
-    if len < 0 {
-        return Err(RecvErr::OsErr(Error::last_os_error().to_string()));
-    }
-
-    if unsafe { (*mhdr).msg_flags } == MSG_TRUNC {
-        return Err(RecvErr::MsgTrunc);
-    }
-
-    Ok(len as usize)
 }
 
 // https://man7.org/linux/man-pages/man7/netlink.7.html#EXAMPLES
@@ -188,24 +130,17 @@ fn parse_msg<F: Sized + NlaPolicyValidator, B: Buffer>(
     Ok(rt)
 }
 
-fn rust_close(sfd: i32) -> Result<(), String> {
-    if unsafe { close(sfd) } < 0 {
-        return Err(Error::last_os_error().to_string());
-    }
-    Ok(())
-}
-
 fn get_gateway(ifname: [i8; IFNAMSIZ]) -> Option<SockaddrStorage> {
-    let sfd = match quick_socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE) {
-        Ok(socket_file_descriptor) => socket_file_descriptor,
+    let mut nls = match netlink::Socket::new() {
+        Ok(netlink_socket) => netlink_socket,
         Err(e) => {
-            eprintln!("unabled to create socket: {e}");
+            eprintln!("{e}");
             return None;
         }
     };
-    let mut sa: sockaddr_nl = unsafe { mem::zeroed() };
-    sa.nl_family = match u16::try_from(AF_NETLINK) {
-        Ok(netlink) => netlink,
+
+    match nls.bind() {
+        Ok(_) => {}
         Err(e) => {
             eprintln!("{e}");
             return None;
@@ -228,11 +163,6 @@ fn get_gateway(ifname: [i8; IFNAMSIZ]) -> Option<SockaddrStorage> {
         }
     };
 
-    if let Err(e) = checked_bind(sfd, ptr::addr_of!(sa).cast::<sockaddr>(), stuct_size) {
-        eprintln!("unable to bind to socket {sfd}: {e}");
-        return None;
-    }
-
     let v = match create_rtrequest(
         NlmsgType::RtmGetRoute,
         flags,
@@ -249,15 +179,18 @@ fn get_gateway(ifname: [i8; IFNAMSIZ]) -> Option<SockaddrStorage> {
         }
     };
 
-    if let Err(e) = checked_sendto(sfd, v.as_ptr().cast::<c_void>(), v.len() * SLACK, 0) {
-        eprintln!("error sending get route request: {e}");
-        return None;
-    }
+    match nls.sendto(v, 0) {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("{e}");
+            return None;
+        }
+    };
 
-    let mut msgbuf = ByteVec::new(8192);
-    let mut mhdr = create_nlmsg(&mut sa, &mut msgbuf);
+    let mut msgbuf = ByteVec::new(BUF_SZ);
+    let mut mhdr = nls.create_msg(&mut msgbuf);
 
-    let mut rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC);
+    let mut rx_bytes = nls.recvmsg(mhdr, MSG_PEEK | MSG_TRUNC);
 
     while let Err(e) = rx_bytes {
         if msgbuf.sz() > TB {
@@ -265,9 +198,9 @@ fn get_gateway(ifname: [i8; IFNAMSIZ]) -> Option<SockaddrStorage> {
             return None;
         }
         msgbuf.realloc(4);
-        mhdr = create_nlmsg(&mut sa, &mut msgbuf);
+        mhdr = nls.create_msg(&mut msgbuf);
 
-        rx_bytes = recv_nlmsg(sfd, &mut mhdr, MSG_PEEK | MSG_TRUNC);
+        rx_bytes = nls.recvmsg(mhdr, MSG_PEEK | MSG_TRUNC);
     }
 
     while msgbuf.idx() < rx_bytes.clone().ok().unwrap() {
@@ -471,58 +404,66 @@ impl NetworkInterface {
             .count_ones() as u8
     }
 
-    pub fn start(&self) -> Result<(), String> {
+    pub fn start(&self) -> io::Result<()> {
         let mut ifr = ifreq {
-            ifr_name: self.c_ifname()?,
+            ifr_name: self
+                .c_ifname()
+                .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?,
             ifr_ifru: unsafe { mem::zeroed() },
         };
 
-        let sfd = quick_socket(AF_INET, SOCK_DGRAM, IPPROTO_IP)?;
+        let nls = netlink::Socket::new()?;
+        nls.bind()?;
 
         unsafe {
-            if ioctl(sfd, SIOCGIFFLAGS, &ifr) < 0 {
-                return Err(Error::last_os_error().to_string());
+            if ioctl(nls.fd(), SIOCGIFFLAGS, &ifr) < 0 {
+                return Err(Error::last_os_error());
             }
 
             ifr.ifr_ifru.ifru_flags |= IFF_UP as i16;
 
-            if ioctl(sfd, SIOCSIFFLAGS, &ifr) < 0 {
-                return Err(Error::last_os_error().to_string());
+            if ioctl(nls.fd(), SIOCSIFFLAGS, &ifr) < 0 {
+                return Err(Error::last_os_error());
             }
         }
 
-        rust_close(sfd)
+        Ok(())
     }
 
-    pub fn stop(&self) -> Result<(), String> {
+    pub fn stop(&self) -> io::Result<()> {
         let mut ifr = ifreq {
-            ifr_name: self.c_ifname()?,
+            ifr_name: self
+                .c_ifname()
+                .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?,
             ifr_ifru: unsafe { mem::zeroed() },
         };
 
-        let sfd = quick_socket(AF_INET, SOCK_DGRAM, IPPROTO_IP)?;
+        let nls = netlink::Socket::new()?;
+        nls.bind()?;
+
         unsafe {
-            if ioctl(sfd, SIOCGIFFLAGS, &ifr) < 0 {
-                return Err(Error::last_os_error().to_string());
+            if ioctl(nls.fd(), SIOCGIFFLAGS, &ifr) < 0 {
+                return Err(Error::last_os_error());
             }
 
             ifr.ifr_ifru.ifru_flags &= !(IFF_UP as i16);
 
-            if ioctl(sfd, SIOCSIFFLAGS, &ifr) < 0 {
-                return Err(Error::last_os_error().to_string());
+            if ioctl(nls.fd(), SIOCSIFFLAGS, &ifr) < 0 {
+                return Err(Error::last_os_error());
             }
         }
-        rust_close(sfd)
+
+        Ok(())
     }
 
-    pub fn restart(&self) -> Result<(), String> {
+    pub fn restart(&self) -> io::Result<()> {
         self.stop()?;
         thread::sleep(Duration::from_millis(3000));
         self.start()
     }
 
     pub fn add_route(&self, rtm_protocol: RtmProtocol, rtm_scope: RtScope) -> Result<(), String> {
-        let mut nls = match NetlinkSocket::new() {
+        let mut nls = match netlink::Socket::new() {
             Ok(netlink_socket) => netlink_socket,
             Err(e) => return Err(e.to_string()),
         };
@@ -616,7 +557,7 @@ impl NetworkInterface {
         };
 
         let mut msgbuf = ByteBuffer::<BUF_SZ>::new();
-        let mut mhdr = nls.create_msg(&mut msgbuf);
+        let mhdr = nls.create_msg(&mut msgbuf);
 
         let rx_bytes = match nls.recvmsg(mhdr, MSG_PEEK | MSG_TRUNC) {
             Ok(recvd) => recvd,
@@ -631,7 +572,7 @@ impl NetworkInterface {
     }
 
     pub fn del_route(&self, rtm_protocol: RtmProtocol, rtm_scope: RtScope) -> Result<(), String> {
-        let mut nls = match NetlinkSocket::new() {
+        let mut nls = match netlink::Socket::new() {
             Ok(netlink_socket) => netlink_socket,
             Err(e) => return Err(e.to_string()),
         };
@@ -736,7 +677,7 @@ impl NetworkInterface {
     }
 
     pub fn show_routes(&self) -> io::Result<()> {
-        let mut nls = NetlinkSocket::new()?;
+        let mut nls = netlink::Socket::new()?;
         nls.bind()?;
 
         let v = match create_rtrequest(
@@ -794,7 +735,7 @@ impl NetworkInterface {
     }
 
     pub fn stats(&self) -> Result<(), String> {
-        let mut nls = match NetlinkSocket::new() {
+        let mut nls = match netlink::Socket::new() {
             Ok(netlink_socket) => netlink_socket,
             Err(e) => return Err(e.to_string()),
         };
@@ -852,7 +793,7 @@ impl NetworkInterface {
     }
 
     pub fn stats64(&self) -> Result<(), String> {
-        let mut nls = match NetlinkSocket::new() {
+        let mut nls = match netlink::Socket::new() {
             Ok(netlink_socket) => netlink_socket,
             Err(e) => return Err(e.to_string()),
         };

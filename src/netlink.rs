@@ -335,12 +335,12 @@ impl PackedStruct for LinkStat64 {
 }
 
 #[derive(Debug)]
-pub struct NetlinkSocket {
+pub struct Socket {
     descriptor: i32,
     sa: libc::sockaddr_nl,
 }
 
-impl Drop for NetlinkSocket {
+impl Drop for Socket {
     fn drop(&mut self) {
         // SAFETY:
         // drop (close) may only be called once
@@ -352,7 +352,7 @@ impl Drop for NetlinkSocket {
     }
 }
 
-impl NetlinkSocket {
+impl Socket {
     pub fn new() -> io::Result<Self> {
         let sfd = trust_fall!(libc::socket(
             AF_NETLINK,
@@ -391,6 +391,10 @@ impl NetlinkSocket {
         }
 
         Ok(self)
+    }
+
+    pub fn fd(&self) -> i32 {
+        self.descriptor
     }
 
     pub fn sendto(&self, v: Vec<u8>, flags: i32) -> io::Result<&Self> {
