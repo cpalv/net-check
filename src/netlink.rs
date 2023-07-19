@@ -6,6 +6,7 @@ use std::net::Ipv4Addr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{mem, ptr, vec};
 
+use clap::ValueEnum;
 use nix::libc;
 
 use nix::libc::{
@@ -105,6 +106,50 @@ pub struct LinkStat {
     rx_compressed: u32,
     tx_compressed: u32,
     rx_nohandler: u32,
+}
+
+impl fmt::Display for LinkStat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "rx_packets={}\ttx_packets={}
+rx_bytes={}\ttx_bytes={}
+rx_errors={}\ttx_errors={}
+rx_dropped={}\ttx_dropped={}
+multicast={}\tcollisions={}
+rx_length_errors={}\trx_over_errors={}\trx_crc_errors={}
+rx_frame_errors={}\trx_fifo_errors={}\trx_missed_errors={}
+tx_aborted_errors={}\ttx_carrier_errors={}\ttx_fifo_errors={}
+tx_heartbeat_errors={}\ttx_window_errors={}\t
+rx_compressed={}
+tx_compressed={}
+rx_nohandler={}",
+            self.rx_packets,
+            self.tx_packets,
+            self.rx_bytes,
+            self.tx_bytes,
+            self.rx_errors,
+            self.tx_errors,
+            self.rx_dropped,
+            self.tx_dropped,
+            self.multicast,
+            self.collisions,
+            self.rx_length_errors,
+            self.rx_over_errors,
+            self.rx_crc_errors,
+            self.rx_frame_errors,
+            self.rx_fifo_errors,
+            self.rx_missed_errors,
+            self.tx_aborted_errors,
+            self.tx_carrier_errors,
+            self.tx_fifo_errors,
+            self.tx_heartbeat_errors,
+            self.tx_window_errors,
+            self.rx_compressed,
+            self.tx_compressed,
+            self.rx_nohandler
+        )
+    }
 }
 
 impl PackedStructInfo for LinkStat {
@@ -233,6 +278,54 @@ pub struct LinkStat64 {
     rx_compressed: u64,
     tx_compressed: u64,
     rx_nohandler: u64,
+}
+
+impl fmt::Display for LinkStat64 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            format_args!(
+                "RX:
+packets={:<15}bytes={:<22}errors={}
+dropped={:<15}length_errors={:<14}over_errors={}
+crc_errors={:<12}frame_errors={:<15}fifo_errors={}
+missed_errors={:<9}compressed={:<17}nohandler={}
+
+TX:
+packets={:<15}bytes={:<22}errors={}
+dropped={:<15}aborted_errors={:<13}carrier_errors={}
+fifo_errors={:<11}heartbeat_errors={:<11}window_errors={}
+compressed={:<12}collisions={}
+
+multicast={}\n",
+                self.rx_packets,
+                self.rx_bytes,
+                self.rx_errors,
+                self.rx_dropped,
+                self.rx_length_errors,
+                self.rx_over_errors,
+                self.rx_crc_errors,
+                self.rx_frame_errors,
+                self.rx_fifo_errors,
+                self.rx_missed_errors,
+                self.rx_compressed,
+                self.rx_nohandler,
+                self.tx_packets,
+                self.tx_bytes,
+                self.tx_errors,
+                self.tx_dropped,
+                self.tx_aborted_errors,
+                self.tx_carrier_errors,
+                self.tx_fifo_errors,
+                self.tx_heartbeat_errors,
+                self.tx_window_errors,
+                self.tx_compressed,
+                self.collisions,
+                self.multicast,
+            )
+        )
+    }
 }
 
 impl PackedStructInfo for LinkStat64 {
@@ -597,7 +690,7 @@ pub enum RtnType {
 }
 
 #[repr(u8)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 pub enum RtmProtocol {
     Kernel = RTPROT_KERNEL,
     Dhcp = 16,
@@ -605,7 +698,7 @@ pub enum RtmProtocol {
 }
 
 #[repr(u8)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 pub enum RtScope {
     Link = RT_SCOPE_LINK,
     Universe = RT_SCOPE_UNIVERSE,

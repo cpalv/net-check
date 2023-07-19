@@ -2,7 +2,7 @@ use core::fmt;
 
 use std::io;
 use std::io::Error;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, IpAddr::V4, IpAddr::V6, Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::time::Duration;
 use std::{mem, thread};
 
@@ -134,7 +134,7 @@ fn get_gateway(ifname: [i8; IFNAMSIZ]) -> Option<SockaddrStorage> {
     let mut nls = match netlink::Socket::new() {
         Ok(netlink_socket) => netlink_socket,
         Err(e) => {
-            eprintln!("{e}");
+            eprintln!("new socket: {e}");
             return None;
         }
     };
@@ -142,30 +142,14 @@ fn get_gateway(ifname: [i8; IFNAMSIZ]) -> Option<SockaddrStorage> {
     match nls.bind() {
         Ok(_) => {}
         Err(e) => {
-            eprintln!("{e}");
-            return None;
-        }
-    };
-
-    let stuct_size = match map_err_str!(u32::try_from(mem::size_of::<sockaddr_nl>())) {
-        Ok(size) => size,
-        Err(e) => {
-            eprintln!("{e}");
-            return None;
-        }
-    };
-
-    let flags = match u16::try_from(NLM_F_REQUEST | NLM_F_DUMP) {
-        Ok(flags) => flags,
-        Err(e) => {
-            eprintln!("{e}");
+            eprintln!("bind: {e}");
             return None;
         }
     };
 
     let v = match create_rtrequest(
         NlmsgType::RtmGetRoute,
-        flags,
+        (NLM_F_REQUEST | NLM_F_DUMP) as u16,
         0,
         RtnType::Unspecified,
         RtmProtocol::Unspecified,
@@ -179,10 +163,12 @@ fn get_gateway(ifname: [i8; IFNAMSIZ]) -> Option<SockaddrStorage> {
         }
     };
 
+    println!("{v:?}");
+
     match nls.sendto(v, 0) {
         Ok(_) => {}
         Err(e) => {
-            eprintln!("{e}");
+            eprintln!("sendto: {e}");
             return None;
         }
     };
@@ -326,7 +312,7 @@ impl fmt::Display for NetworkInterface {
             if let (Some(broadcast), Some(ip4_gwy)) = (self.broadcast, self.ip4_gatway) {
                 interface_info.push_str(
                         format!(
-                            "IPv4:\n\tNetwork Address: {}\n\tGateway Address: {}\n\tHost Address: {}/{}\n\tBroadcast: {}\n",
+                            "IPv4:\n\tNetwork Address: {:>15}\n\tGateway Address: {:>15}\n\tHost Address: {:>18}/{}\n\tBroadcast: {:>21}\n",
                             ip4_net_addr.to_string().replace(":0", ""),
                             ip4_gwy.to_string().replace(":0", ""),
                             ip4_addr.to_string().replace(":0", ""),
@@ -339,7 +325,7 @@ impl fmt::Display for NetworkInterface {
                 // Loopback interface does not have a broadcast address
                 interface_info.push_str(
                     format!(
-                        "IPv4: {}/{}\n",
+                        "IPv4: {:>15}/{}\n",
                         ip4_addr.to_string().replace(":0", ""),
                         ip4_mask.as_sockaddr_in().unwrap().ip().count_ones(),
                     )
@@ -462,7 +448,47 @@ impl NetworkInterface {
         self.start()
     }
 
-    pub fn add_route(&self, rtm_protocol: RtmProtocol, rtm_scope: RtScope) -> Result<(), String> {
+    pub fn add_route(
+        &self,
+        rtm_protocol: RtmProtocol,
+        rtm_scope: RtScope,
+        src: IpAddr,
+        dst: IpAddr,
+    ) -> Result<(), String> {
+        if (src.is_ipv4() && !dst.is_ipv4()) || (src.is_ipv6() && !dst.is_ipv6()) {
+            return Err(format!("{src} and {dst} must be the same address type"));
+        }
+
+        let ssb = match src {
+            V4(v4addr) => SockaddrStorage::from(SocketAddrV4::new(v4addr, 0))
+                .as_sockaddr_in()
+                .unwrap()
+                .ip()
+                .to_be_bytes()
+                .to_vec(),
+            V6(v6addr) => SockaddrStorage::from(SocketAddrV6::new(v6addr, 0, 0, 0))
+                .as_sockaddr_in6()
+                .unwrap()
+                .ip()
+                .octets()
+                .to_vec(),
+        };
+
+        let dsb = match dst {
+            V4(v4addr) => SockaddrStorage::from(SocketAddrV4::new(v4addr, 0))
+                .as_sockaddr_in()
+                .unwrap()
+                .ip()
+                .to_be_bytes()
+                .to_vec(),
+            V6(v6addr) => SockaddrStorage::from(SocketAddrV6::new(v6addr, 0, 0, 0))
+                .as_sockaddr_in6()
+                .unwrap()
+                .ip()
+                .octets()
+                .to_vec(),
+        };
+
         let mut nls = match netlink::Socket::new() {
             Ok(netlink_socket) => netlink_socket,
             Err(e) => return Err(e.to_string()),
@@ -486,26 +512,8 @@ impl NetworkInterface {
                 rtm_protocol,
                 rtm_scope,
                 vec![
-                    (
-                        NlaType::RtaDestination,
-                        self.ip4_net_addr
-                            .unwrap()
-                            .as_sockaddr_in()
-                            .unwrap()
-                            .ip()
-                            .to_be_bytes()
-                            .to_vec(),
-                    ),
-                    (
-                        NlaType::RtaPrefSource,
-                        self.ip4_host_addr
-                            .unwrap()
-                            .as_sockaddr_in()
-                            .unwrap()
-                            .ip()
-                            .to_be_bytes()
-                            .to_vec(),
-                    ),
+                    (NlaType::RtaDestination, dsb),
+                    (NlaType::RtaPrefSource, ssb),
                     (NlaType::RtaPriority, 100_u32.to_ne_bytes().to_vec()),
                     (NlaType::RtaOIF, self.if_idx.to_ne_bytes().to_vec()),
                 ],
@@ -518,26 +526,8 @@ impl NetworkInterface {
                 rtm_protocol,
                 rtm_scope,
                 vec![
-                    (
-                        NlaType::RtaGateway,
-                        self.ip4_gatway
-                            .unwrap()
-                            .as_sockaddr_in()
-                            .unwrap()
-                            .ip()
-                            .to_be_bytes()
-                            .to_vec(),
-                    ),
-                    (
-                        NlaType::RtaPrefSource,
-                        self.ip4_host_addr
-                            .unwrap()
-                            .as_sockaddr_in()
-                            .unwrap()
-                            .ip()
-                            .to_be_bytes()
-                            .to_vec(),
-                    ),
+                    (NlaType::RtaGateway, dsb),
+                    (NlaType::RtaPrefSource, ssb),
                     (NlaType::RtaPriority, 100_u32.to_ne_bytes().to_vec()),
                     (NlaType::RtaOIF, self.if_idx.to_ne_bytes().to_vec()),
                 ],
@@ -571,7 +561,47 @@ impl NetworkInterface {
         Ok(())
     }
 
-    pub fn del_route(&self, rtm_protocol: RtmProtocol, rtm_scope: RtScope) -> Result<(), String> {
+    pub fn del_route(
+        &self,
+        rtm_protocol: RtmProtocol,
+        rtm_scope: RtScope,
+        src: IpAddr,
+        dst: IpAddr,
+    ) -> Result<(), String> {
+        if (src.is_ipv4() && !dst.is_ipv4()) || (src.is_ipv6() && !dst.is_ipv6()) {
+            return Err(format!("{src} and {dst} must be the same address type"));
+        }
+
+        let ssb = match src {
+            V4(v4addr) => SockaddrStorage::from(SocketAddrV4::new(v4addr, 0))
+                .as_sockaddr_in()
+                .unwrap()
+                .ip()
+                .to_be_bytes()
+                .to_vec(),
+            V6(v6addr) => SockaddrStorage::from(SocketAddrV6::new(v6addr, 0, 0, 0))
+                .as_sockaddr_in6()
+                .unwrap()
+                .ip()
+                .octets()
+                .to_vec(),
+        };
+
+        let dsb = match dst {
+            V4(v4addr) => SockaddrStorage::from(SocketAddrV4::new(v4addr, 0))
+                .as_sockaddr_in()
+                .unwrap()
+                .ip()
+                .to_be_bytes()
+                .to_vec(),
+            V6(v6addr) => SockaddrStorage::from(SocketAddrV6::new(v6addr, 0, 0, 0))
+                .as_sockaddr_in6()
+                .unwrap()
+                .ip()
+                .octets()
+                .to_vec(),
+        };
+
         let mut nls = match netlink::Socket::new() {
             Ok(netlink_socket) => netlink_socket,
             Err(e) => return Err(e.to_string()),
@@ -591,26 +621,8 @@ impl NetworkInterface {
                 rtm_protocol,
                 rtm_scope,
                 vec![
-                    (
-                        NlaType::RtaDestination,
-                        self.ip4_net_addr
-                            .unwrap()
-                            .as_sockaddr_in()
-                            .unwrap()
-                            .ip()
-                            .to_be_bytes()
-                            .to_vec(),
-                    ),
-                    (
-                        NlaType::RtaPrefSource,
-                        self.ip4_host_addr
-                            .unwrap()
-                            .as_sockaddr_in()
-                            .unwrap()
-                            .ip()
-                            .to_be_bytes()
-                            .to_vec(),
-                    ),
+                    (NlaType::RtaDestination, dsb),
+                    (NlaType::RtaPrefSource, ssb),
                     (NlaType::RtaPriority, 100_u32.to_ne_bytes().to_vec()),
                     (NlaType::RtaOIF, self.if_idx.to_ne_bytes().to_vec()),
                 ],
@@ -623,26 +635,8 @@ impl NetworkInterface {
                 rtm_protocol,
                 rtm_scope,
                 vec![
-                    (
-                        NlaType::RtaGateway,
-                        self.ip4_gatway
-                            .unwrap()
-                            .as_sockaddr_in()
-                            .unwrap()
-                            .ip()
-                            .to_be_bytes()
-                            .to_vec(),
-                    ),
-                    (
-                        NlaType::RtaPrefSource,
-                        self.ip4_host_addr
-                            .unwrap()
-                            .as_sockaddr_in()
-                            .unwrap()
-                            .ip()
-                            .to_be_bytes()
-                            .to_vec(),
-                    ),
+                    (NlaType::RtaGateway, dsb),
+                    (NlaType::RtaPrefSource, ssb),
                     (NlaType::RtaPriority, 100_u32.to_ne_bytes().to_vec()),
                     (NlaType::RtaOIF, self.if_idx.to_ne_bytes().to_vec()),
                 ],
@@ -734,15 +728,14 @@ impl NetworkInterface {
         Ok(())
     }
 
-    pub fn stats(&self) -> Result<(), String> {
+    pub fn stats(&self) -> Result<LinkStat, String> {
         let mut nls = match netlink::Socket::new() {
             Ok(netlink_socket) => netlink_socket,
             Err(e) => return Err(e.to_string()),
         };
 
-        match nls.bind() {
-            Ok(_) => {}
-            Err(e) => return Err(e.to_string()),
+        if let Err(e) = nls.bind() {
+            return Err(format!("{e}"));
         };
 
         let v = netlink::create_ifirequest(
@@ -758,9 +751,8 @@ impl NetworkInterface {
             )],
         )?;
 
-        match nls.sendmsg(v, 0) {
-            Ok(_) => {}
-            Err(e) => return Err(format!("{e}")),
+        if let Err(e) = nls.sendmsg(v, 0) {
+            return Err(format!("{e}"));
         };
 
         let mut msgbuf = ByteVec::new(BUF_SZ);
@@ -785,22 +777,17 @@ impl NetworkInterface {
             break;
         });
 
-        if stats.is_some() {
-            println!("{:?}", stats.unwrap());
-        }
-
-        Ok(())
+        stats.ok_or_else(|| format!("stats not available"))
     }
 
-    pub fn stats64(&self) -> Result<(), String> {
+    pub fn stats64(&self) -> Result<LinkStat64, String> {
         let mut nls = match netlink::Socket::new() {
             Ok(netlink_socket) => netlink_socket,
             Err(e) => return Err(e.to_string()),
         };
 
-        match nls.bind() {
-            Ok(_) => {}
-            Err(e) => return Err(e.to_string()),
+        if let Err(e) = nls.bind() {
+            return Err(format!("{e}"));
         };
 
         let v = netlink::create_ifirequest(
@@ -816,9 +803,8 @@ impl NetworkInterface {
             )],
         )?;
 
-        match nls.sendmsg(v, 0) {
-            Ok(_) => {}
-            Err(e) => return Err(format!("{e}")),
+        if let Err(e) = nls.sendmsg(v, 0) {
+            return Err(format!("{e}"));
         };
 
         let mut msgbuf = ByteVec::new(BUF_SZ);
@@ -843,10 +829,6 @@ impl NetworkInterface {
             break;
         });
 
-        if stats.is_some() {
-            println!("{:?}", stats.unwrap());
-        }
-
-        Ok(())
+        stats.ok_or_else(|| format!("stats64 not available"))
     }
 }

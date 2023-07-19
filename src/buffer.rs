@@ -105,7 +105,7 @@ macro_rules! write_impl {
 
         fn gib<T: Copy>(&mut self, strict: bool) -> Result<T, String> {
             let ptr = self.ptr_cast::<T>(strict)?;
-            Ok(unsafe { *ptr })
+            Ok(unsafe { ptr.read_unaligned() })
         }
 
         fn gib_byte(&mut self) -> Result<u8, String> {
@@ -505,12 +505,11 @@ mod tests {
         let mut bb = ByteVec::new(32);
         let np = bb.ptr_cast::<nlmsghdr>(false).unwrap() as *mut nlmsghdr;
 
-
         unsafe { *np = n }
 
         bb.reset();
         let nl = bb.gib::<nlmsghdr>(false).unwrap();
-        
+
         assert_eq!(n, nl)
     }
 }
