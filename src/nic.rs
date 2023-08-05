@@ -1,16 +1,18 @@
 use core::fmt;
 
+use std::ffi;
 use std::io;
 use std::io::Error;
-use std::net::{IpAddr, IpAddr::V4, IpAddr::V6, Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+use std::net::{IpAddr, IpAddr::V4, IpAddr::V6, Ipv4Addr, SocketAddrV4, SocketAddrV6};
 use std::time::Duration;
-use std::{mem, thread};
+use std::{mem, ptr, thread};
 
 use nix::ifaddrs::{self, InterfaceAddress};
+use nix::libc;
 use nix::libc::{
-    if_indextoname, if_nametoindex, ifreq, ioctl, sockaddr_nl, ARPHRD_NETROM, IFF_UP, IFLA_STATS,
-    IFLA_STATS64, IFNAMSIZ, MSG_PEEK, MSG_TRUNC, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL,
-    NLM_F_REQUEST, RTA_DST, RTA_GATEWAY, RTA_OIF, RTA_PRIORITY, RTA_TABLE, RTEXT_FILTER_SKIP_STATS,
+    if_indextoname, if_nametoindex, ifreq, ioctl, ARPHRD_NETROM, IFF_UP, IFLA_STATS, IFLA_STATS64,
+    IFNAMSIZ, MSG_PEEK, MSG_TRUNC, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REQUEST,
+    RTA_DST, RTA_GATEWAY, RTA_OIF, RTA_PRIORITY, RTA_TABLE, RTEXT_FILTER_SKIP_STATS,
     RTEXT_FILTER_VF, RT_TABLE_MAIN, SIOCGIFFLAGS, SIOCSIFFLAGS,
 };
 use nix::net::if_::InterfaceFlags;
@@ -149,7 +151,8 @@ fn get_gateway(ifname: [i8; IFNAMSIZ]) -> Option<SockaddrStorage> {
 
     let v = match create_rtrequest(
         NlmsgType::RtmGetRoute,
-        (NLM_F_REQUEST | NLM_F_DUMP) as u16,
+        //(NLM_F_REQUEST | NLM_F_ACK | NLM_F_DUMP | NLM_F_EXCL | NLM_F_CREATE) as u16,
+        (NLM_F_REQUEST | NLM_F_DUMP | NLM_F_ACK) as u16,
         0,
         RtnType::Unspecified,
         RtmProtocol::Unspecified,
@@ -163,18 +166,19 @@ fn get_gateway(ifname: [i8; IFNAMSIZ]) -> Option<SockaddrStorage> {
         }
     };
 
-    println!("{v:?}");
-
-    match nls.sendto(v, 0) {
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("sendto: {e}");
-            return None;
-        }
-    };
+    if let Err(e) = nls.sendto(v.as_ptr() as *const _ as *const ffi::c_void, v.len(), 0) {
+        eprintln!("sendto: {e}");
+        return None;
+    }
 
     let mut msgbuf = ByteVec::new(BUF_SZ);
-    let mut mhdr = nls.create_msg(&mut msgbuf);
+
+    let mut iov = libc::iovec {
+        iov_base: msgbuf.buf_mut_ptr().cast::<ffi::c_void>(),
+        iov_len: msgbuf.sz(),
+    };
+
+    let mut mhdr = nls.create_msg(&mut iov, &mut msgbuf);
 
     let mut rx_bytes = nls.recvmsg(mhdr, MSG_PEEK | MSG_TRUNC);
 
@@ -184,7 +188,7 @@ fn get_gateway(ifname: [i8; IFNAMSIZ]) -> Option<SockaddrStorage> {
             return None;
         }
         msgbuf.realloc(4);
-        mhdr = nls.create_msg(&mut msgbuf);
+        mhdr = nls.create_msg(&mut iov, &mut msgbuf);
 
         rx_bytes = nls.recvmsg(mhdr, MSG_PEEK | MSG_TRUNC);
     }
@@ -541,13 +545,19 @@ impl NetworkInterface {
             ));
         }
 
-        match nls.sendto(v, 0) {
-            Ok(_) => {}
-            Err(e) => return Err(e.to_string()),
-        };
+        if let Err(e) = nls.sendto(v.as_ptr() as *const _ as *const ffi::c_void, v.len(), 0) {
+            eprintln!("sendto: {e}");
+            return Err(e.to_string());
+        }
 
         let mut msgbuf = ByteBuffer::<BUF_SZ>::new();
-        let mhdr = nls.create_msg(&mut msgbuf);
+
+        let mut iov = libc::iovec {
+            iov_base: msgbuf.buf_mut_ptr().cast::<ffi::c_void>(),
+            iov_len: msgbuf.sz(),
+        };
+
+        let mhdr = nls.create_msg(&mut iov, &mut msgbuf);
 
         let rx_bytes = match nls.recvmsg(mhdr, MSG_PEEK | MSG_TRUNC) {
             Ok(recvd) => recvd,
@@ -650,13 +660,19 @@ impl NetworkInterface {
             ));
         }
 
-        match nls.sendto(v, 0) {
-            Ok(_) => {}
-            Err(e) => return Err(e.to_string()),
-        };
+        if let Err(e) = nls.sendto(v.as_ptr() as *const _ as *const ffi::c_void, v.len(), 0) {
+            eprintln!("sendto: {e}");
+            return Err(e.to_string());
+        }
 
         let mut msgbuf = ByteBuffer::<BUF_SZ>::new();
-        let mut mhdr = nls.create_msg(&mut msgbuf);
+
+        let mut iov = libc::iovec {
+            iov_base: msgbuf.buf_mut_ptr().cast::<ffi::c_void>(),
+            iov_len: msgbuf.sz(),
+        };
+
+        let mhdr = nls.create_msg(&mut iov, &mut msgbuf);
 
         let rx_bytes = match nls.recvmsg(mhdr, MSG_PEEK | MSG_TRUNC) {
             Ok(recvd) => recvd,
@@ -687,10 +703,16 @@ impl NetworkInterface {
             Err(e) => return Err(Error::new(io::ErrorKind::OutOfMemory, e)),
         };
 
-        nls.sendto(v, 0)?;
+        nls.sendto(v.as_ptr() as *const _ as *const ffi::c_void, v.len(), 0)?;
 
         let mut msgbuf = ByteVec::new(BUF_SZ);
-        let mut mhdr = nls.create_msg(&mut msgbuf);
+
+        let mut iov = libc::iovec {
+            iov_base: msgbuf.buf_mut_ptr().cast::<ffi::c_void>(),
+            iov_len: msgbuf.sz(),
+        };
+
+        let mut mhdr = nls.create_msg(&mut iov, &mut msgbuf);
 
         let mut rx_bytes = nls.recvmsg(mhdr, MSG_PEEK | MSG_TRUNC);
 
@@ -707,7 +729,7 @@ impl NetworkInterface {
                         ));
                     }
                     msgbuf.realloc(4);
-                    mhdr = nls.create_msg(&mut msgbuf);
+                    mhdr = nls.create_msg(&mut iov, &mut msgbuf);
 
                     rx_bytes = nls.recvmsg(mhdr, MSG_PEEK | MSG_TRUNC);
                 }
@@ -756,7 +778,13 @@ impl NetworkInterface {
         };
 
         let mut msgbuf = ByteVec::new(BUF_SZ);
-        let mhdr = nls.create_msg(&mut msgbuf);
+
+        let mut iov = libc::iovec {
+            iov_base: msgbuf.buf_mut_ptr().cast::<ffi::c_void>(),
+            iov_len: msgbuf.sz(),
+        };
+
+        let mhdr = nls.create_msg(&mut iov, &mut msgbuf);
 
         let rx_bytes = match nls.recvmsg(mhdr, MSG_PEEK | MSG_TRUNC) {
             Ok(recvd) => recvd,
@@ -808,7 +836,13 @@ impl NetworkInterface {
         };
 
         let mut msgbuf = ByteVec::new(BUF_SZ);
-        let mhdr = nls.create_msg(&mut msgbuf);
+
+        let mut iov = libc::iovec {
+            iov_base: msgbuf.buf_mut_ptr().cast::<ffi::c_void>(),
+            iov_len: msgbuf.sz(),
+        };
+
+        let mhdr = nls.create_msg(&mut iov, &mut msgbuf);
 
         let rx_bytes = match nls.recvmsg(mhdr, MSG_PEEK | MSG_TRUNC) {
             Ok(recvd) => recvd,

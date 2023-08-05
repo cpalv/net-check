@@ -57,9 +57,9 @@ impl CliApp {
     pub fn run() -> i32 {
         let cli = CliApp::parse();
 
-        if let Some(ifname) = cli.interface.as_deref() {
-            let netifs = nic::get_nics();
+        let netifs = nic::get_nics();
 
+        if let Some(ifname) = cli.interface.as_deref() {
             if let Some(interface) = netifs.iter().find(|&netif| netif.name == ifname) {
                 match &cli.cmds {
                     Some(Commands::Start) => {
@@ -123,16 +123,19 @@ impl CliApp {
                         }
                     },
                     None => {
-                        for netif in netifs {
-                            println!("{netif}");
-                        }
-                        return 0;
+                        eprintln!("no command provided for {interface}");
+                        return 1;
                     }
                 };
             } else {
                 eprintln!("{ifname} is not an existing interface");
                 return 1;
             }
+        } else {
+            for netif in netifs {
+                println!("{netif}");
+            }
+            return 0;
         }
 
         return 1;

@@ -490,11 +490,11 @@ impl Socket {
         self.descriptor
     }
 
-    pub fn sendto(&self, v: Vec<u8>, flags: i32) -> io::Result<&Self> {
+    pub fn sendto(&self, buf: *const ffi::c_void, len: usize, flags: i32) -> io::Result<&Self> {
         let rc = trust_fall!(libc::sendto(
             self.descriptor,
-            v.as_ptr().cast::<ffi::c_void>(),
-            v.len() * SLACK,
+            buf,
+            len,
             flags,
             ptr::null::<libc::sockaddr>(),
             0,
@@ -513,6 +513,7 @@ impl Socket {
             ptr::addr_of_mut!(msghdr),
             flags
         ));
+
         if len < 0 {
             return Err(RecvErr::OsErr(io::Error::last_os_error().to_string()));
         }
@@ -548,16 +549,11 @@ impl Socket {
         Ok(sent_bytes as usize)
     }
 
-    pub fn create_msg<B: Buffer>(&mut self, msgbuf: &mut B) -> libc::msghdr {
-        let mut iov = libc::iovec {
-            iov_base: msgbuf.buf_mut_ptr().cast::<ffi::c_void>(),
-            iov_len: msgbuf.sz(),
-        };
-
+    pub fn create_msg<B: Buffer>(&mut self, iov: &mut libc::iovec, msgbuf: &mut B) -> libc::msghdr {
         libc::msghdr {
             msg_name: ptr::addr_of_mut!(self.sa) as *mut ffi::c_void,
             msg_namelen: mem::size_of::<libc::sockaddr_nl>() as u32,
-            msg_iov: &mut iov,
+            msg_iov: iov,
             msg_iovlen: 1,
             msg_control: ptr::null_mut::<ffi::c_void>(),
             msg_controllen: 0,
